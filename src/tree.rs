@@ -1,11 +1,14 @@
+#![allow(unused)]
+
 use crate::eg_env::{Ckpt, EgraphEnv};
 // use crate::env::Env;
-use crate::node::{Node, NodeStub};
+use crate::node::{Node, NodeStub, print_tree};
 use crate::pool_manager;
 use crate::workers::Reply;
+use crate::utils::save_data_to_file;
 
 #[allow(unused_imports)]
-use egg::{Analysis, CostFunction, EGraph, Id, Language, LpCostFunction, RecExpr, Rewrite};
+use egg::{Analysis, CostFunction, EGraph, Id, Language, LpCostFunction, RecExpr, Rewrite, Extractor};
 use rand::Rng;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -14,11 +17,13 @@ use std::marker::PhantomData;
 use std::rc::Rc;
 use std::thread;
 use std::time::{Duration, Instant};
+use std::path::PathBuf;
+use serde_json::json;
 // use log::info;
 
 pub struct ExpTask<L, N>
 where
-    L: Language + 'static + egg::FromOp + std::marker::Send,
+    L: Language + 'static + egg::FromOp + std::marker::Send + std::fmt::Display,
     N: Analysis<L> + Clone + 'static + std::default::Default + std::marker::Send,
     N::Data: Clone,
     <N as Analysis<L>>::Data: Send,
@@ -33,7 +38,7 @@ where
 #[derive(Clone)]
 pub struct SimTask<L, N>
 where
-    L: Language + 'static + egg::FromOp + std::marker::Send,
+    L: Language + 'static + egg::FromOp + std::marker::Send + std::fmt::Display,
     N: Analysis<L> + Clone + 'static + std::default::Default + std::marker::Send,
     N::Data: Clone,
     <N as Analysis<L>>::Data: Send,
@@ -43,13 +48,15 @@ where
     pub saving_idx: u32,
     pub action_applied: bool,
     pub child_saturated: bool,
+    pub children_saturated: Vec<bool>,
+    pub children_saturated_cnt: usize,
     d1: PhantomData<L>,
     d2: PhantomData<N>,
 }
 
 pub struct Tree<L, N, CF>
 where
-    L: Language + 'static + egg::FromOp + std::marker::Send,
+    L: Language + 'static + egg::FromOp + std::marker::Send + std::fmt::Display,
     N: Analysis<L> + Clone + 'static + std::default::Default + std::marker::Send,
     N::Data: Clone,
     <N as Analysis<L>>::Data: Send,
@@ -65,11 +72,21 @@ where
     sim_pool: pool_manager::PoolManager<L, N, CF>,
     // ckpts: HashMap<u32, Vec<usize>>,
     ckpts: HashMap<u32, Ckpt<L, N>>,
+    ckpts_old: HashMap<u32, Ckpt<L, N>>,
     cf: CF,
     lp_extract: bool,
 
+    prune_actions: bool,
+    // rollout_strategy: String,
+    subtree_caching: bool,
+    select_max_uct_action: bool,
+
+    // experiment tracking
+    output_dir: PathBuf,
+
     // for planning
     root_node: Rc<RefCell<Node>>,
+    best_child_node: Option<Rc<RefCell<Node>>>,
     global_saving_idx: u32,
     simulation_count: u32,
     expansion_tasks: HashMap<u32, ExpTask<L, N>>,
@@ -89,7 +106,7 @@ where
 
 impl<L, N, CF> Tree<L, N, CF>
 where
-    L: Language + 'static + egg::FromOp + std::marker::Send,
+    L: Language + 'static + egg::FromOp + std::marker::Send + std::fmt::Display,
     N: Analysis<L> + Clone + 'static + std::default::Default + std::marker::Send,
     N::Data: Clone,
     <N as Analysis<L>>::Data: Send,
@@ -103,6 +120,12 @@ where
         gamma: f32,
         expansion_worker_num: usize,
         simulation_worker_num: usize,
+        prune_actions: bool,
+        rollout_strategy: String,
+        subtree_caching: bool,
+        select_max_uct_action: bool,
+        // experiment tracking
+        output_dir: PathBuf,
         // egg
         egraph: EGraph<L, N>,
         id: Id,
@@ -128,6 +151,8 @@ where
                 rules.clone(),
                 cf.clone(),
                 lp_extract,
+                prune_actions,
+                rollout_strategy.clone(),
                 node_limit,
                 time_limit,
             ),
@@ -142,14 +167,25 @@ where
                 rules.clone(),
                 cf.clone(),
                 lp_extract,
+                prune_actions,
+                rollout_strategy.clone(),
                 node_limit,
                 time_limit,
             ),
             ckpts: HashMap::new(),
+            ckpts_old: HashMap::new(),
             cf: cf,
             lp_extract: lp_extract,
 
+            prune_actions: prune_actions,
+            // rollout_strategy: rollout_strategy,
+            subtree_caching: subtree_caching,
+            select_max_uct_action: select_max_uct_action,
+
+            output_dir: output_dir,
+
             root_node: Node::dummy(),
+            best_child_node: None,
             global_saving_idx: 0,
             simulation_count: 0,
             expansion_tasks: HashMap::new(),
@@ -181,6 +217,7 @@ where
             rules,
             self.cf.clone(),
             self.lp_extract,
+            self.prune_actions,
             self.node_limit,
             self.time_limit,
         );
@@ -198,11 +235,20 @@ where
         // env loop
         loop {
             let planning_time = Instant::now();
-            let action = self.plan(&state, &env);
+            let (action, pruned_root_actions, cached_subtree_nodes) = self.plan(&state, &mut env);
             let planning_time = planning_time.elapsed().as_secs();
             total_planning_time += planning_time;
 
-            (state, reward, done, info) = env.step(action);
+            match action {
+                usize::MAX => {
+                    println!("Search stopped, because the egraph is fully saturated. Performing dummy final action.");
+                    (state, reward, done, info) = env.step(0);
+                    done = true;
+                },
+                _ => {
+                    (state, reward, done, info) = env.step(action);
+                }
+            }
 
             iter += 1;
             episode_reward += reward;
@@ -213,25 +259,69 @@ where
             );
             println!("{}", info.report);
             println!("************************");
+
+            let iteration = json!({
+                // iteration data
+                "action": action,
+                "planning_time": planning_time,
+                "total_planning_time": total_planning_time,
+                "reward": reward,
+                "episode_reward": episode_reward,
+                "base_cost": env.base_cost,
+                "best_cost": info.best_cost,
+                "done": done,
+                "pruned_root_actions": pruned_root_actions,
+                "cached_subtree_nodes": cached_subtree_nodes,
+
+                // runner stats
+                "runner_iterations": info.report.iterations,
+                "runner_stop_reason": info.report.stop_reason,
+                "runner_egraph_nodes": info.report.egraph_nodes,
+                "runner_egraph_classes": info.report.egraph_classes,
+                "runner_memo_size": info.report.memo_size,
+                "runner_rebuilds": info.report.rebuilds,
+                "runner_total_time": info.report.total_time,
+                "runner_search_time": info.report.search_time,
+                "runner_apply_time": info.report.apply_time,
+                "runner_rebuild_time": info.report.rebuild_time,
+            });
+
+            save_data_to_file(&iteration, &self.output_dir, "rmcts_iteration_data.txt");
+
             if done || info.best_cost < cost_threshold || iter >= iter_limit {
                 break;
             }
         }
+
+        // Extract best cost and expression
+        let extractor = Extractor::new(&env.egraph, self.cf.clone());
+        let (rmcts_cost, rmcts_expr) = extractor.find_best(env.root_id);
+        save_data_to_file(&rmcts_expr, &self.output_dir, "rmcts_expr.txt");
+
         println!(
-            "[RMCTS] Done:: base_cost {} -> cost {} with iter {} and time {}s",
+            "[RMCTS] Done:: base_cost {} -> cost {:?} with iter {} and time {}s",
             env.base_cost, info.best_cost, iter, total_planning_time,
         );
+
+        // Save RMCTS stats
+        let rmcts_stats = json!({
+            "base_cost": env.base_cost,
+            "best_cost": info.best_cost,
+            "optimization_time": total_planning_time,
+        });
+        save_data_to_file(&rmcts_stats, &self.output_dir, "rmcts_stats.txt");
 
         self.close();
         env.egraph
     }
 
     // fn plan(&mut self, _state: &(), env: &Env<L, N>) -> usize {
-    fn plan(&mut self, _state: &(), env: &EgraphEnv<L, N, CF>) -> usize {
+    // Returns: (action, #pruned root actions, #cached nodes)
+    fn plan(&mut self, _state: &(), env: &mut EgraphEnv<L, N, CF>) -> (usize, usize, u32) {
         // skip if action space is 1
         let action_n = env.get_action_space();
         if action_n == 1 {
-            return 0;
+            return (0, 0, 0);
         }
 
         // clear
@@ -247,16 +337,76 @@ where
         self.exp_pool.wait_until_all_idle();
         self.sim_pool.wait_until_all_idle();
 
-        // build current state
-        self.ckpts.insert(self.global_saving_idx, env.checkpoint());
-        self.root_node = Node::new(action_n, self.global_saving_idx, self.gamma, true, None);
-        self.global_saving_idx += 1;
+        match &self.best_child_node {
+            Some(best_child_node) => {
+                println!("Reuse cached subtree with {} nodes.", best_child_node.borrow().visit_count);
+                println!("Cached root node has {} pruned children.", best_child_node.borrow().children_pruned);
+                self.root_node = best_child_node.clone();
+                self.root_node.borrow_mut().parent = None;
+                self.root_node.borrow_mut().is_head = true;
+
+                // Update checkpoints
+                let mut node_stack = vec![self.root_node.clone()];
+                while !node_stack.is_empty() {
+                    let node = node_stack.pop().unwrap();
+
+                    match self.ckpts_old.get(&node.borrow().checkpoint_idx) {
+                        Some(checkpoint) => {
+                            self.ckpts.insert(self.global_saving_idx, checkpoint.clone());
+                        },
+                        // Checkpoint can be missing, if the expansion returned done = true
+                        None => {}
+                    }
+
+                    node.borrow_mut().checkpoint_idx = self.global_saving_idx;
+                    self.global_saving_idx += 1;
+
+                    for child_node in node.borrow().children.clone().into_iter() {
+                        if child_node.is_some() {
+                            node_stack.push(child_node.clone().unwrap());
+                        }
+                    };
+                };
+            },
+            None => {
+                println!("No cached subtree.");
+                // Perform action pruning for root node
+                let (children_saturated, children_saturated_cnt) = env.action_pruning(vec![false; action_n]);
+                self.root_node = Node::new(None, action_n, self.global_saving_idx, self.gamma, true, None, children_saturated, children_saturated_cnt);
+                println!("Pruned {} children of the root node.", self.root_node.borrow().children_saturated_cnt);
+
+                // build current state
+                self.ckpts.insert(self.global_saving_idx, env.checkpoint());
+                self.global_saving_idx += 1;
+            }
+        }
+
+        let root_visit_count = self.root_node.borrow().visit_count;
+        self.simulation_count = self.root_node.borrow().visit_count;
 
         // run main mcts
         let mut depth = 0;
-        for sim_idx in 0..self.budget {
-            let d = self.simulate_single_step(sim_idx);
+        let mut root_saturated = false;
+        for sim_idx in root_visit_count..self.budget {
+            // If all children of the root saturated, stop immediately. There is no point in continuing the search.
+            if self.root_node.borrow().all_child_saturated() {
+                root_saturated = true;
+                break
+            }
+
+            // print_tree(&self.root_node.borrow(), 3, 0);
+
+            let (d, saturated) = self.simulate_single_step(sim_idx);
             depth = std::cmp::max(depth, d);
+
+            // If all leaf nodes are saturated, stop the search
+            if saturated {
+                break;
+            }
+        }
+
+        if root_saturated {
+            return (usize::MAX, self.root_node.borrow().children_pruned, root_visit_count)
         }
 
         // clean up
@@ -270,10 +420,23 @@ where
         // thread, as a way to handle stragger
 
         // final action
-        self.root_node.borrow().select_uct_action(true)
+        let best_action;
+        if self.select_max_uct_action {
+            best_action = self.root_node.borrow().select_uct_action(true)
+        } else {
+            best_action = self.root_node.borrow().select_max_visited_action()
+        }
+
+        // Subtree caching
+        if self.subtree_caching {
+            self.best_child_node = self.root_node.borrow().children[best_action].clone();
+            self.ckpts_old = self.ckpts.clone();
+        }
+
+        (best_action, self.root_node.borrow().children_pruned, root_visit_count)
     }
 
-    fn simulate_single_step(&mut self, sim_idx: u32) -> u32 {
+    fn simulate_single_step(&mut self, sim_idx: u32) -> (u32, bool) {
         // Selection
         let mut curr_node: Rc<RefCell<Node>> = Rc::clone(&self.root_node);
         let mut curr_depth = 1;
@@ -282,11 +445,16 @@ where
 
         loop {
             let rand = rng.gen_range(0.0..1.0);
-            if (curr_node.borrow().no_child_available())
-                || (curr_node.borrow().is_head && (!curr_node.borrow().all_child_visited()))
-                || ((!curr_node.borrow().is_head && !curr_node.borrow().all_child_visited())
-                    && rand < 0.5)
+            if ((!curr_node.borrow().all_child_visited()) && (!curr_node.borrow().all_non_pruned_child_visited()))
+                && (curr_node.borrow().no_child_available()
+                || curr_node.borrow().is_head
+                || !curr_node.borrow().is_head && rand < 0.5)
+            // if (curr_node.borrow().no_child_available() && (!curr_node.borrow().all_child_visited()))
+            //     || (curr_node.borrow().is_head && (!curr_node.borrow().all_child_visited()))
+            //     || ((!curr_node.borrow().is_head && !curr_node.borrow().all_child_visited())
+            //         && rand < 0.5)
             {
+                // Don't expand if all children (that are not pruned) have already been visited.
                 // If no child node has been updated, we have to expand anyway.
                 // Or if root node is not fully visited.
                 // Or if non-root node is not fully visited and {with prob 1/2}.
@@ -317,6 +485,11 @@ where
                 break;
             }
 
+            // If all leaf nodes are saturated, stop the search
+            if curr_node.borrow().all_child_saturated() {
+                println!("All children saturated!");
+                return (curr_depth, true)
+            }
             let action = curr_node.borrow().select_uct_action(false);
             let reward = curr_node.borrow().rewards[action].clone();
             curr_node
@@ -358,6 +531,8 @@ where
                     reward,
                     done,
                     child_saturated,
+                    children_saturated,
+                    children_saturated_cnt,
                     new_checkpoint_data,
                     saving_idx,
                     task_idx,
@@ -379,6 +554,8 @@ where
                             saving_idx,
                             self.gamma,
                             child_saturated,
+                            children_saturated,
+                            children_saturated_cnt,
                             Rc::clone(&curr_node_copy),
                         );
                         self.incomplete_update(Rc::clone(&curr_node_copy), task_idx);
@@ -398,6 +575,8 @@ where
                                 saving_idx: saving_idx,
                                 action_applied: true,
                                 child_saturated: child_saturated,
+                                children_saturated: children_saturated,
+                                children_saturated_cnt: children_saturated_cnt,
                                 d1: PhantomData,
                                 d2: PhantomData,
                             },
@@ -446,6 +625,8 @@ where
                     sim_task.saving_idx,
                     self.gamma,
                     sim_task.child_saturated,
+                    sim_task.children_saturated,
+                    sim_task.children_saturated_cnt,
                     Rc::clone(&curr_node_copy),
                 );
                 self.complete_update(Rc::clone(&curr_node_copy), task_idx, accu_reward);
@@ -454,7 +635,7 @@ where
                 panic!("DoneSimulation destructure fails");
             }
         }
-        curr_depth
+        (curr_depth, false)
     }
 
     fn incomplete_update(&mut self, mut curr_node: Rc<RefCell<Node>>, idx: u32) {
@@ -479,6 +660,19 @@ where
             .borrow_mut()
             .update_complete(idx, rolling_accu_reward);
     }
+
+    // fn update_saturated_children(&mut self, mut curr_node: Rc<RefCell<Node>>) {
+    //     while curr_node.borrow().children_saturated_cnt == curr_node.borrow().action_n {
+    //         let saturated_action = curr_node.borrow().action;
+    //         if curr_node.borrow().is_head {
+    //             break;
+    //         }
+    //         let parent: Rc<RefCell<Node>> = Rc::clone(curr_node.borrow().parent.as_ref().unwrap());
+    //         curr_node = parent;
+    //         curr_node.borrow_mut().children_saturated[saturated_action.unwrap()] = true;
+    //         curr_node.borrow_mut().children_saturated_cnt += 1;
+    //     }
+    // }
 
     fn close(&mut self) {
         self.exp_pool.close();

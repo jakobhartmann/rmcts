@@ -1,13 +1,13 @@
-#![allow(unused_variables)]
+#![allow(unused)]
+// source: rmcts/tests/math.rs
 
 use egg::{rewrite as rw, *};
 use ordered_float::NotNan;
-use rmcts::run::{run_mcts, MCTSArgs};
+use crate::run::{run_mcts, MCTSArgs};
 
 use rand::prelude::*;
 use rand_chacha::ChaCha8Rng;
 use std::collections::HashMap;
-use std::path::PathBuf;
 
 pub type EGraph = egg::EGraph<Math, ConstantFold>;
 pub type Rewrite = egg::Rewrite<Math, ConstantFold>;
@@ -32,40 +32,6 @@ define_language! {
 
         Constant(Constant),
         Symbol(Symbol), }
-}
-
-// You could use egg::AstSize, but this is useful for debugging, since
-// it will really try to get rid of the Diff operator
-#[derive(Clone)]
-pub struct MathCostFn;
-impl egg::CostFunction<Math> for MathCostFn {
-    type Cost = usize;
-    fn cost<C>(&mut self, enode: &Math, mut costs: C) -> Self::Cost
-    where
-        C: FnMut(Id) -> Self::Cost,
-    {
-        // only SymbolLang provides `op` field, which can `as_str()`
-        // let op_cost = match enode.op.as_str() {
-        //     "d" => 100,
-        //     "i" => 100,
-        //     _ => 1,
-        // };
-        // enode.fold(op_cost, |sum, i| sum + costs(i))
-        //
-        let op_cost = match enode {
-            Math::Diff(..) => 100,
-            Math::Integral(..) => 100,
-            _ => 1,
-        };
-        enode.fold(op_cost, |sum, i| sum + costs(i))
-    }
-}
-
-#[cfg_attr(docsrs, doc(cfg(feature = "lp")))]
-impl LpCostFunction<Math, ConstantFold> for MathCostFn {
-    fn node_cost(&mut self, _egraph: &EGraph, _eclass: Id, _enode: &Math) -> f64 {
-        1.0
-    }
 }
 
 #[derive(Default, Clone)]
@@ -233,61 +199,7 @@ pub fn rules() -> Vec<Rewrite> { vec![
         "(- (* ?a (i ?b ?x)) (i (* (d ?x ?a) (i ?b ?x)) ?x))"),
 ]}
 
-#[test]
-fn math_build_lang_by_hand() {
-    let mut expr = RecExpr::default();
-
-    let leaf1 = Math::Symbol("a".into());
-    let leaf2 = Math::Constant(NotNan::new(1.0).unwrap());
-    let id1 = expr.add(leaf1);
-    let id2 = expr.add(leaf2);
-
-    let node = Math::from_op("*", vec![id1, id2]).unwrap();
-    expr.add(node);
-    println!("is-dag {}", expr.is_dag());
-
-    // run
-    let runner = Runner::default()
-        .with_iter_limit(20)
-        .with_expr(&expr)
-        .run(&rules());
-    let root = runner.roots[0];
-    let extractor = Extractor::new(&runner.egraph, AstSize);
-    let (best_cost, best) = extractor.find_best(root);
-    println!(
-        "Simplified {} to {} with best cost {}",
-        expr, best, best_cost
-    );
-}
-
-#[test]
-fn math_cost_fn() {
-    let mut expr = RecExpr::default();
-
-    let leaf1 = Math::Symbol("a".into());
-    let leaf2 = Math::Constant(NotNan::new(1.0).unwrap());
-    let id1 = expr.add(leaf1);
-    let id2 = expr.add(leaf2);
-
-    let node = Math::from_op("*", vec![id1, id2]).unwrap();
-    expr.add(node);
-}
-
-#[test]
-fn math_rand_seed() {
-    let seed = 0;
-    let mut rng = ChaCha8Rng::seed_from_u64(seed);
-    let rand = rng.gen_range(0..100);
-
-    for _ in 0..100 {
-        let seed = 0;
-        let mut rng = ChaCha8Rng::seed_from_u64(seed);
-        let sample = rng.gen_range(0..100);
-        assert_eq!(rand, sample);
-    }
-}
-
-fn build_rand_expr(seed: u64, depth: u32) -> RecExpr<Math> {
+pub fn build_rand_expr(seed: u64, depth: u32) -> RecExpr<Math> {
     const OPS: [&str; 11] = [
         "d", "i", "+", "-", "*", "/", "pow", "ln", "sqrt", "sin", "cos",
     ];
@@ -347,128 +259,4 @@ fn dfs(
         let id = expr.add(node);
         return id;
     }
-}
-
-#[test]
-fn math_lp_extract() {
-    let expr: RecExpr<Math> = "(pow (+ x (+ x x)) (+ x x))".parse().unwrap();
-
-    let runner: Runner<Math, ConstantFold> = Runner::default()
-        .with_iter_limit(3)
-        .with_expr(&expr)
-        .run(&rules());
-    let root = runner.roots[0];
-
-    let best = Extractor::new(&runner.egraph, AstSize).find_best(root).1;
-    let lp_best = LpExtractor::new(&runner.egraph, AstSize).solve(root);
-
-    println!("input   [{}] {}", expr.as_ref().len(), expr);
-    println!("normal  [{}] {}", best.as_ref().len(), best);
-    println!("ilp cse [{}] {}", lp_best.as_ref().len(), lp_best);
-
-    assert_ne!(best, lp_best);
-    assert_eq!(lp_best.as_ref().len(), 4);
-}
-
-#[test]
-fn math_egg() {
-    // build
-    let depth = 7;
-    let seed = 1;
-    let expr = build_rand_expr(seed, depth);
-    run_egg(true, &expr);
-    run_egg(false, &expr);
-
-    fn run_egg(backoff: bool, expr: &RecExpr<Math>) {
-        let runner = if backoff {
-            Runner::default().with_iter_limit(100).with_expr(expr)
-        } else {
-            Runner::default()
-                .with_iter_limit(100)
-                .with_scheduler(egg::SimpleScheduler)
-                .with_expr(expr)
-        };
-        let root = runner.roots[0];
-        // base cost
-        // let extractor = Extractor::new(&runner.egraph, AstSize);
-        let extractor = Extractor::new(&runner.egraph, MathCostFn);
-        let (base_cost, _base) = extractor.find_best(root);
-        // best
-        let runner = runner.run(&rules());
-        // let extractor = Extractor::new(&runner.egraph, AstSize);
-        let extractor = Extractor::new(&runner.egraph, MathCostFn);
-        let (best_cost, best) = extractor.find_best(root);
-        println!(
-            "Simplified {} to {} with base_cost {} -> cost {}",
-            expr, best, base_cost, best_cost
-        );
-        runner.print_report();
-    }
-}
-
-#[test]
-fn math_mcts_geb() {
-    println!("num rules {}", rules().len());
-    // build
-    let depth = 7;
-    let seed = 1;
-    let expr = build_rand_expr(seed, depth);
-    let runner = Runner::default().with_expr(&expr);
-    let root = runner.roots[0];
-    let n_threads = std::thread::available_parallelism().unwrap().get();
-    let args = MCTSArgs {
-        // mcts
-        budget: 512,
-        max_sim_step: 10,
-        gamma: 0.99,
-        expansion_worker_num: 1,
-        simulation_worker_num: 1, // n_threads - 1,
-        lp_extract: false,
-        cost_threshold: 1,
-        iter_limit: 100,
-        prune_actions: true,
-        rollout_strategy: String::from("heavy"),
-        subtree_caching: false,
-        select_max_uct_action: false,
-        // experiment tracking
-        output_dir: PathBuf::from("usr/experiments/tests/"),
-        // egg
-        node_limit: 1_000,
-        time_limit: 10,
-    };
-    run_mcts(runner.egraph, root, rules(), MathCostFn, Some(args));
-}
-
-#[test]
-#[ignore]
-fn math_mcts_geb_lp() {
-    println!("num rules {}", rules().len());
-    // build
-    let depth = 7;
-    let seed = 2;
-    let expr = build_rand_expr(seed, depth);
-    let runner = Runner::default().with_expr(&expr);
-    let root = runner.roots[0];
-    let n_threads = std::thread::available_parallelism().unwrap().get();
-    let args = MCTSArgs {
-        // mcts
-        budget: 512,
-        max_sim_step: 10,
-        gamma: 0.99,
-        expansion_worker_num: 1,
-        simulation_worker_num: n_threads - 1,
-        lp_extract: true,
-        cost_threshold: 1,
-        iter_limit: 30,
-        prune_actions: false,
-        rollout_strategy: String::from("random"),
-        subtree_caching: false,
-        select_max_uct_action: true,
-        // experiment tracking
-        output_dir: PathBuf::from("usr/experiments/tests/"),
-        // egg
-        node_limit: 500,
-        time_limit: 10,
-    };
-    run_mcts(runner.egraph, root, rules(), MathCostFn, Some(args));
 }

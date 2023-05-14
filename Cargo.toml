@@ -7,14 +7,20 @@ edition = "2021"
 
 [dependencies]
 # egg = { version = "0.9.3", features = [ "lp", "serde-1"] }
-egg = { version = "0.9.3", features = ["lp"] }
+egg = { path = "../egg", features = ["serde-1", "lp"] }
 rand = { version = "0.8.5"}
-# serde = { version = "1.0", features = ["derive"] }
-
-
-# test only deps
-[dev-dependencies]
+serde = { version = "1.0.137", features = ["derive"] }
+serde_json = {version = "1.0.81" }
+itertools = { version = "0.10.5" }
 fxhash = "0.2.1"
 ordered-float = "3.0.0"
 env_logger = { version = "0.9.0", default-features = false }
 rand_chacha = "0.3.1"
+
+
+# test only deps
+[dev-dependencies]
+# fxhash = "0.2.1"
+# ordered-float = "3.0.0"
+# env_logger = { version = "0.9.0", default-features = false }
+# rand_chacha = "0.3.1"

@@ -15,7 +15,7 @@ enum Status {
 
 pub struct PoolManager<L, N, CF>
 where
-    L: Language + 'static + egg::FromOp + std::marker::Send,
+    L: Language + 'static + egg::FromOp + std::marker::Send + std::fmt::Display,
     N: Analysis<L> + Clone + 'static + std::default::Default + std::marker::Send,
     N::Data: Clone,
     <N as Analysis<L>>::Data: Send,
@@ -36,7 +36,7 @@ where
 
 impl<L, N, CF> PoolManager<L, N, CF>
 where
-    L: Language + 'static + egg::FromOp + std::marker::Send,
+    L: Language + 'static + egg::FromOp + std::marker::Send + std::fmt::Display,
     N: Analysis<L> + Clone + 'static + std::default::Default + std::marker::Send,
     N::Data: Clone,
     <N as Analysis<L>>::Data: Send,
@@ -44,6 +44,7 @@ where
     usize: From<<CF as CostFunction<L>>::Cost>,
 {
     pub fn new(
+        // mcts
         name: &'static str,
         work_num: usize,
         gamma: f32,
@@ -54,6 +55,9 @@ where
         rules: Vec<Rewrite<L, N>>,
         cf: CF,
         lp_extract: bool,
+        prune_actions: bool,
+        rollout_strategy: String,
+        // egg
         node_limit: usize,
         time_limit: usize,
     ) -> Self {
@@ -72,6 +76,8 @@ where
                 rules.clone(),
                 cf.clone(),
                 lp_extract,
+                prune_actions,
+                rollout_strategy.clone(),
                 node_limit,
                 time_limit,
             );

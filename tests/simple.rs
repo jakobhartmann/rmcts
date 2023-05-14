@@ -1,3 +1,4 @@
+#![allow(unused_imports, unused_variables)]
 use egg::*;
 use rmcts::*;
 

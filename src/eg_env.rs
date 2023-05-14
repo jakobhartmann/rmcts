@@ -1,14 +1,14 @@
-use crate::env::Info;
+use std::time::Duration;
 use egg::{
     Analysis, CostFunction, EGraph, Extractor, Id, Language, LpCostFunction, LpExtractor, Rewrite,
     Runner, SimpleScheduler, StopReason,
 };
-use std::time::Duration;
+use crate::env::Info;
 
 #[derive(Clone)]
 pub struct Ckpt<L, N>
 where
-    L: Language + 'static + egg::FromOp + std::marker::Send,
+    L: Language + 'static + egg::FromOp + std::marker::Send + std::fmt::Display,
     N: Analysis<L> + Clone + 'static + std::default::Default + std::marker::Send,
     N::Data: Clone,
     <N as Analysis<L>>::Data: Send,
@@ -22,7 +22,7 @@ where
 
 pub struct EgraphEnv<L, N, CF>
 where
-    L: Language + 'static + egg::FromOp + std::marker::Send,
+    L: Language + 'static + egg::FromOp + std::marker::Send + std::fmt::Display,
     N: Analysis<L> + Clone + 'static + std::default::Default + std::marker::Send,
     N::Data: Clone,
     <N as Analysis<L>>::Data: Send,
@@ -33,9 +33,11 @@ where
     pub egraph: EGraph<L, N>,
     cf: CF,
     lp_extract: bool,
-    root_id: Id,
+    pub root_id: Id,
     num_rules: usize,
     rules: Vec<Rewrite<L, N>>,
+
+    prune_actions: bool,
 
     node_limit: usize,
     time_limit: std::time::Duration,
@@ -48,7 +50,7 @@ where
 
 impl<L, N, CF> EgraphEnv<L, N, CF>
 where
-    L: Language + 'static + egg::FromOp + std::marker::Send,
+    L: Language + 'static + egg::FromOp + std::marker::Send + std::fmt::Display,
     N: Analysis<L> + Clone + 'static + std::default::Default + std::marker::Send,
     N::Data: Clone,
     <N as Analysis<L>>::Data: Send,
@@ -61,6 +63,7 @@ where
         rules: Vec<Rewrite<L, N>>,
         cf: CF,
         lp_extract: bool,
+        prune_actions: bool,
         node_limit: usize,
         time_limit: usize,
     ) -> Self {
@@ -79,6 +82,7 @@ where
             root_id: root_id,
             num_rules: rules.len(),
             rules: rules,
+            prune_actions: prune_actions,
             node_limit: node_limit,
             time_limit: Duration::from_secs(time_limit.try_into().unwrap()),
 
@@ -134,6 +138,14 @@ where
             StopReason::NodeLimit(_) => {
                 done = true;
                 self.sat_counter = 0;
+                // println!(
+                //     "EGG NodeLimit {}s - {}s - {} - {} - {}",
+                //     node_limit,
+                //     report.total_time,
+                //     report.egraph_nodes,
+                //     report.egraph_classes,
+                //     report.memo_size,
+                // );
             }
             StopReason::TimeLimit(time) => {
                 // TODO this indicates egraph is exploded?
@@ -197,5 +209,36 @@ where
         self.egraph = checkpoint_data.egraph;
         self.root_id = checkpoint_data.root_id;
         self.last_cost = checkpoint_data.last_cost;
+    }
+
+    pub fn action_pruning(&mut self, mut children_saturated: Vec<bool>) -> (Vec<bool>, usize) {
+        if self.prune_actions {
+            if children_saturated.iter().filter(|x| **x).count() > 0 {
+                panic!("At least one child is already saturated. Should this ever happen?");
+            }
+
+            // Create runner with egraph and make sure that it is clean
+            let egraph = std::mem::take(&mut self.egraph);
+            let mut runner = Runner::default().with_egraph(egraph);
+            runner.egraph.rebuild();
+
+            // Iterate over all single-pattern rewrite rules and check if the source pattern is found in the egraph
+            // If the source pattern is found, mark the child accordingly and increase the saturation counter of the environment
+            for (i, rewrite) in self.rules.iter().enumerate() {
+                if rewrite.searcher.n_matches(&runner.egraph) == 0 {
+                    if !children_saturated[i] {
+                        children_saturated[i] = true;
+                        self.sat_counter += 1;
+                    }
+                }
+            }
+
+            // Reclaim the partial graph
+            self.egraph = runner.egraph;
+        }
+
+        // Calculate the number of saturated children and return it together with the corresponding list
+        let children_saturated_cnt = children_saturated.iter().filter(|x| **x).count();
+        (children_saturated, children_saturated_cnt)
     }
 }
