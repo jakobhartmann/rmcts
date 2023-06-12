@@ -55,12 +55,12 @@ impl<L: Language> CostFunction<L> for AstSize {
     }
 }
 
-#[cfg_attr(docsrs, doc(cfg(feature = "lp")))]
-impl<L: Language, N: Analysis<L>> LpCostFunction<L, N> for AstSize {
-    fn node_cost(&mut self, _egraph: &egg::EGraph<L, N>, _eclass: Id, _enode: &L) -> f64 {
-        1.0
-    }
-}
+// #[cfg_attr(docsrs, doc(cfg(feature = "lp")))]
+// impl<L: Language, N: Analysis<L>> LpCostFunction<L, N> for AstSize {
+//     fn node_cost(&mut self, _egraph: &egg::EGraph<L, N>, _eclass: Id, _enode: &L) -> f64 {
+//         1.0
+//     }
+// }
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Settings {
@@ -89,6 +89,10 @@ struct Settings {
 }
 
 fn run_math_experiments (settings: Settings, run_egg: bool) {
+    if settings.domain != String::from("math") {
+        panic!("Wrong domain! Got {}, but expected math!", settings.domain)
+    }
+
     // Create output dir
     let experiment_name = settings.domain.clone() + "_" + &settings.expression_depth.to_string() + "_" + &settings.expression_seed.to_string();
     let output_dir = Path::new(&settings.experiments_base_path).join(experiment_name);
@@ -173,6 +177,10 @@ fn run_math_experiments (settings: Settings, run_egg: bool) {
 }
 
 fn run_prop_experiments(settings: Settings, run_egg: bool) {
+    if settings.domain != String::from("prop") {
+        panic!("Wrong domain! Got {}, but expected prop!", settings.domain)
+    }
+
     // Create output dir
     let experiment_name = settings.domain.clone() + "_" + &settings.expression_depth.to_string() + "_" + &settings.expression_seed.to_string();
     let output_dir = Path::new(&settings.experiments_base_path).join(experiment_name);
@@ -259,11 +267,11 @@ fn run_prop_experiments(settings: Settings, run_egg: bool) {
 fn main() {
     let mut settings = Settings {
         // expression
-        domain: String::from("prop"),
+        domain: String::from("math"),
         expression_depth: 10,
         expression_seed: 0,
         // experiment tracking
-        experiments_base_path: String::from("/usr/experiments/prop/"),
+        experiments_base_path: String::from("../experiments/math/"),
         // mcts
         budget: 512,
         max_sim_step: 10,
@@ -278,28 +286,28 @@ fn main() {
         subtree_caching: false,
         select_max_uct_action: true,
         // egg
-        node_limit: 5_000,
+        node_limit: 10_000,
         time_limit: 1,
     };
 
     // Experiment 1: egg vs. rmcts
-    let expressions_seeds = vec![0, 1, 2, 3, 4];
-    let node_limits = vec![5_000, 10_000];
+    let expressions_seeds = vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+    let node_limits = vec![500, 1_000, 2_000, 5_000, 10_000, 20_000];
     let mut settings1 = settings.clone();
 
     for seed in &expressions_seeds {    
         for node_limit in &node_limits {
             settings1.expression_seed = *seed;
             settings1.node_limit = *node_limit;
-            settings1.experiments_base_path = String::from("/usr/experiments/prop/egg_vs_rmcts/".to_owned() + &node_limit.to_string());
-            run_prop_experiments(settings1.clone(), true);
+            settings1.experiments_base_path = String::from("../experiments/math/egg_vs_rmcts/".to_owned() + &node_limit.to_string());
+            run_math_experiments(settings1.clone(), true);
         }
     }
 
     // Experiment 2: subtree caching and action selection strategy
     let subtree_caching_options = vec![false, true];
     let action_select_strategies = vec![false, true];
-    let expressions_seeds = vec![0, 1, 2, 3, 4];
+    let expressions_seeds = vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
     let mut settings2 = settings.clone();
 
     for seed in &expressions_seeds {
@@ -308,15 +316,15 @@ fn main() {
                 settings2.expression_seed = *seed;
                 settings2.subtree_caching = *option;
                 settings2.select_max_uct_action = *strategy;
-                settings2.experiments_base_path = String::from("/usr/experiments/prop/subtree_caching/".to_owned() + &option.to_string() + "/" + &strategy.to_string());
-                run_prop_experiments(settings2.clone(), true);
+                settings2.experiments_base_path = String::from("../experiments/math/subtree_caching/".to_owned() + &option.to_string() + "/" + &strategy.to_string());
+                run_math_experiments(settings2.clone(), true);
             }
         }
     }
 
-    // Experiment 3: rmcts with and without action pruning
-    let expressions_seeds = vec![0, 1, 2, 3, 4];
-    let experiments = vec![(false, String::from("random")), (true, String::from("pruning")), (true, String::from("heavy"))];
+    // Experiment 3: mcts with and without action pruning
+    let expressions_seeds = vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+    let experiments = vec![(false, String::from("random")), (true, String::from("random")), (true, String::from("pruning")), (true, String::from("heavy"))];
     let mut settings3 = settings.clone();
 
     for experiment in &experiments {
@@ -325,13 +333,13 @@ fn main() {
             settings3.expression_seed = *seed;
             settings3.prune_actions = *prune_actions;
             settings3.rollout_strategy = rollout_strategy.clone();
-            settings3.experiments_base_path = String::from("/usr/experiments/prop/pruning/".to_owned() + &prune_actions.to_string() + "_" + &rollout_strategy.to_owned());
-            run_prop_experiments(settings3.clone(), true);
+            settings3.experiments_base_path = String::from("../experiments/math/pruning/".to_owned() + &prune_actions.to_string() + "_" + &rollout_strategy.to_owned());
+            run_math_experiments(settings3.clone(), true);
         }
     }
 
-    // Experiment 4: rmcts with different budgets
-    let expressions_seeds = vec![0, 1, 2, 3, 4];
+    // Experiment 4: mcts with different budgets
+    let expressions_seeds = vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
     let budgets = vec![64, 128, 256, 512, 1024];
     let mut settings4 = settings.clone();
 
@@ -339,13 +347,13 @@ fn main() {
         for seed in &expressions_seeds {
             settings4.expression_seed = *seed;
             settings4.budget = *budget;
-            settings4.experiments_base_path = String::from("/usr/experiments/prop/budget/".to_owned() + &budget.to_string());
-            run_prop_experiments(settings4.clone(), true);
+            settings4.experiments_base_path = String::from("../experiments/math/budget/".to_owned() + &budget.to_string());
+            run_math_experiments(settings4.clone(), true);
         }
     }
 
-    // Experiment 5: rmcts with different simulation depths
-    let expressions_seeds = vec![0, 1, 2, 3, 4];
+    // // Experiment 5: mcts with different simulation depths
+    let expressions_seeds = vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
     let max_sim_steps = vec![5, 10, 15];
     let mut settings5 = settings.clone();
 
@@ -353,8 +361,8 @@ fn main() {
         for seed in &expressions_seeds {
             settings5.expression_seed = *seed;
             settings5.max_sim_step = *max_sim_step;
-            settings5.experiments_base_path = String::from("/usr/experiments/prop/simulation_depth/".to_owned() + &max_sim_step.to_string());
-            run_prop_experiments(settings5.clone(), true);
+            settings5.experiments_base_path = String::from("../experiments/math/simulation_depth/".to_owned() + &max_sim_step.to_string());
+            run_math_experiments(settings5.clone(), true);
         }
     }
 
@@ -373,7 +381,7 @@ fn main() {
     //     subtree_caching: true,
     //     select_max_uct_action: false,
     //     // experiment tracking
-    //     output_dir: Path::new("/usr/experiments/tests/").to_path_buf(),
+    //     output_dir: Path::new("../experiments/tests/").to_path_buf(),
     //     // egg
     //     node_limit: 10_000,
     //     time_limit: 1,

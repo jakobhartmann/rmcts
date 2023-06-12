@@ -8,7 +8,7 @@ use crate::workers::Reply;
 use crate::utils::save_data_to_file;
 
 #[allow(unused_imports)]
-use egg::{Analysis, CostFunction, EGraph, Id, Language, LpCostFunction, RecExpr, Rewrite, Extractor};
+use egg::{Analysis, CostFunction, EGraph, Id, Language, RecExpr, Rewrite, Extractor};
 use rand::Rng;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -60,7 +60,7 @@ where
     N: Analysis<L> + Clone + 'static + std::default::Default + std::marker::Send,
     N::Data: Clone,
     <N as Analysis<L>>::Data: Send,
-    CF: CostFunction<L> + LpCostFunction<L, N> + Clone + std::marker::Send + 'static,
+    CF: CostFunction<L> + Clone + std::marker::Send + 'static,
     usize: From<<CF as CostFunction<L>>::Cost>,
 {
     // from param
@@ -110,7 +110,7 @@ where
     N: Analysis<L> + Clone + 'static + std::default::Default + std::marker::Send,
     N::Data: Clone,
     <N as Analysis<L>>::Data: Send,
-    CF: CostFunction<L> + LpCostFunction<L, N> + Clone + std::marker::Send + 'static,
+    CF: CostFunction<L> + Clone + std::marker::Send + 'static,
     usize: From<<CF as CostFunction<L>>::Cost>,
 {
     pub fn new(

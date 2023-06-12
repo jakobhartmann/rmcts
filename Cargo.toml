@@ -7,7 +7,7 @@ edition = "2021"
 
 [dependencies]
 # egg = { version = "0.9.3", features = [ "lp", "serde-1"] }
-egg = { path = "../egg", features = ["serde-1", "lp"] }
+egg = { path = "../egg", features = ["serde-1"] }
 rand = { version = "0.8.5"}
 serde = { version = "1.0.137", features = ["derive"] }
 serde_json = {version = "1.0.81" }

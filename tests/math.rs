@@ -61,12 +61,12 @@ impl egg::CostFunction<Math> for MathCostFn {
     }
 }
 
-#[cfg_attr(docsrs, doc(cfg(feature = "lp")))]
-impl LpCostFunction<Math, ConstantFold> for MathCostFn {
-    fn node_cost(&mut self, _egraph: &EGraph, _eclass: Id, _enode: &Math) -> f64 {
-        1.0
-    }
-}
+// #[cfg_attr(docsrs, doc(cfg(feature = "lp")))]
+// impl LpCostFunction<Math, ConstantFold> for MathCostFn {
+//     fn node_cost(&mut self, _egraph: &EGraph, _eclass: Id, _enode: &Math) -> f64 {
+//         1.0
+//     }
+// }
 
 #[derive(Default, Clone)]
 pub struct ConstantFold;
@@ -349,26 +349,26 @@ fn dfs(
     }
 }
 
-#[test]
-fn math_lp_extract() {
-    let expr: RecExpr<Math> = "(pow (+ x (+ x x)) (+ x x))".parse().unwrap();
+// #[test]
+// fn math_lp_extract() {
+//     let expr: RecExpr<Math> = "(pow (+ x (+ x x)) (+ x x))".parse().unwrap();
 
-    let runner: Runner<Math, ConstantFold> = Runner::default()
-        .with_iter_limit(3)
-        .with_expr(&expr)
-        .run(&rules());
-    let root = runner.roots[0];
+//     let runner: Runner<Math, ConstantFold> = Runner::default()
+//         .with_iter_limit(3)
+//         .with_expr(&expr)
+//         .run(&rules());
+//     let root = runner.roots[0];
 
-    let best = Extractor::new(&runner.egraph, AstSize).find_best(root).1;
-    let lp_best = LpExtractor::new(&runner.egraph, AstSize).solve(root);
+//     let best = Extractor::new(&runner.egraph, AstSize).find_best(root).1;
+//     let lp_best = LpExtractor::new(&runner.egraph, AstSize).solve(root);
 
-    println!("input   [{}] {}", expr.as_ref().len(), expr);
-    println!("normal  [{}] {}", best.as_ref().len(), best);
-    println!("ilp cse [{}] {}", lp_best.as_ref().len(), lp_best);
+//     println!("input   [{}] {}", expr.as_ref().len(), expr);
+//     println!("normal  [{}] {}", best.as_ref().len(), best);
+//     println!("ilp cse [{}] {}", lp_best.as_ref().len(), lp_best);
 
-    assert_ne!(best, lp_best);
-    assert_eq!(lp_best.as_ref().len(), 4);
-}
+//     assert_ne!(best, lp_best);
+//     assert_eq!(lp_best.as_ref().len(), 4);
+// }
 
 #[test]
 fn math_egg() {

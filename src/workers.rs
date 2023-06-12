@@ -4,7 +4,7 @@ use crate::tree::{ExpTask, SimTask};
 
 #[allow(unused_imports)]
 use egg::{
-    Analysis, CostFunction, EGraph, Id, Language, LpCostFunction, RecExpr, Rewrite, StopReason,
+    Analysis, CostFunction, EGraph, Id, Language, RecExpr, Rewrite, StopReason,
 };
 use rand::{Rng};
 use rand::distributions::{WeightedIndex, Distribution};
@@ -63,7 +63,7 @@ where
     N: Analysis<L> + Clone + 'static + std::default::Default + std::marker::Send,
     N::Data: Clone,
     <N as Analysis<L>>::Data: Send,
-    CF: CostFunction<L> + LpCostFunction<L, N> + Clone + std::marker::Send + 'static,
+    CF: CostFunction<L> + Clone + std::marker::Send + 'static,
     usize: From<<CF as CostFunction<L>>::Cost>,
 {
     let (tx, rx) = mpsc::channel();
@@ -158,34 +158,34 @@ where
                     let mut action_weights_heavy: Vec<f32> = vec![0.0; action_n]; // (reward / visit count) if the action will not lead to saturation
                     let mut epsilon = 0.0;
 
-                    if rollout_strategy.as_str() != "random" {
-                        action_weights_pruned = sim_task.children_saturated.clone().iter().map(|&x| {
-                            if x {
-                                0.0
-                            } else {
-                                1.0
-                            }
-                        }).collect();
-                    }
-
-                    let mut non_saturated_actions_visited = 0.0;
-                    if rollout_strategy.as_str() == "heavy" {
-                        // Only consider rewards of actions that do not lead to saturation
-                        for (visit_count, reward, saturated, action_weight) in izip!(&visit_counts, &rewards, &sim_task.children_saturated, &mut action_weights_heavy) {
-                            if !saturated && *visit_count > 0.0 {
-                                *action_weight = reward / visit_count;
-                                non_saturated_actions_visited += 1.0;
-                            }
-                        }
-
-                        // Max is necessary in case all actions lead to saturation
-                        epsilon = f32::max(non_saturated_actions_visited / ((action_n - sim_task.children_saturated_cnt) as f32), 0.0);
-                        // Epsilon = min((#non saturated actions with visit count > 0 / #non saturated actions); 0.75)
-                        epsilon = f32::min(epsilon, 0.75);
-                    }
-
                     // env loop
                     while !done {
+                        if rollout_strategy.as_str() != "random" {
+                            action_weights_pruned = sim_task.children_saturated.clone().iter().map(|&x| {
+                                if x {
+                                    0.0
+                                } else {
+                                    1.0
+                                }
+                            }).collect();
+                        }
+    
+                        let mut non_saturated_actions_visited = 0.0;
+                        if rollout_strategy.as_str() == "heavy" {
+                            // Only consider rewards of actions that do not lead to saturation
+                            for (visit_count, reward, saturated, action_weight) in izip!(&visit_counts, &rewards, &sim_task.children_saturated, &mut action_weights_heavy) {
+                                if !saturated && *visit_count > 0.0 {
+                                    *action_weight = reward / visit_count;
+                                    non_saturated_actions_visited += 1.0;
+                                }
+                            }
+    
+                            // Max is necessary in case all actions lead to saturation
+                            epsilon = f32::max(non_saturated_actions_visited / ((action_n - sim_task.children_saturated_cnt) as f32), 0.0);
+                            // Epsilon = min((#non saturated actions with visit count > 0 / #non saturated actions); 0.75)
+                            epsilon = f32::min(epsilon, 0.25);
+                        }
+
                         let action_weights = match rollout_strategy.as_str() {
                             // Random policy rollouts
                             "random" => {
@@ -215,6 +215,33 @@ where
                                     action_weights_heavy.clone()
                                 }
                             },
+                            "lookahead" => {
+                                // Make a copy of current env
+                                let env_checkpoint = env.checkpoint().clone();
+                                let lh_actions = rand::seq::index::sample(&mut rng, action_n, 5).into_vec();
+
+                                let mut best_action = std::usize::MAX;
+                                let mut best_reward = std::f32::MIN;
+
+                                for lh_action in lh_actions {
+                                    env.restore(env_checkpoint.clone());
+                                    (_state, reward, _, _info) = env.step(lh_action);
+
+                                    if reward > best_reward {
+                                        best_action = lh_action;
+                                        best_reward = reward;
+                                    }
+                                }
+
+                                env.restore(env_checkpoint);
+
+                                if best_action == std::usize::MAX {
+                                    panic!("Something went wrong with lookahead search");
+                                }
+                                let mut action_weights = vec![0.0; action_n];
+                                action_weights[best_action] = 1.0;
+                                action_weights
+                            }
                             _ => {
                                 panic!("Unkown rollout strategy: {}", rollout_strategy);
                             }

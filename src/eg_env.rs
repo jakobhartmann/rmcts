@@ -1,6 +1,6 @@
 use std::time::Duration;
 use egg::{
-    Analysis, CostFunction, EGraph, Extractor, Id, Language, LpCostFunction, LpExtractor, Rewrite,
+    Analysis, CostFunction, EGraph, Extractor, Id, Language, Rewrite,
     Runner, SimpleScheduler, StopReason,
 };
 use crate::env::Info;
@@ -26,12 +26,13 @@ where
     N: Analysis<L> + Clone + 'static + std::default::Default + std::marker::Send,
     N::Data: Clone,
     <N as Analysis<L>>::Data: Send,
-    CF: CostFunction<L> + LpCostFunction<L, N> + Clone + std::marker::Send + 'static,
+    CF: CostFunction<L> + Clone + std::marker::Send + 'static,
     usize: From<<CF as CostFunction<L>>::Cost>,
 {
     init_egraph: EGraph<L, N>,
     pub egraph: EGraph<L, N>,
     cf: CF,
+    #[allow(dead_code)]
     lp_extract: bool,
     pub root_id: Id,
     num_rules: usize,
@@ -54,7 +55,7 @@ where
     N: Analysis<L> + Clone + 'static + std::default::Default + std::marker::Send,
     N::Data: Clone,
     <N as Analysis<L>>::Data: Send,
-    CF: CostFunction<L> + LpCostFunction<L, N> + Clone + std::marker::Send + 'static,
+    CF: CostFunction<L> + Clone + std::marker::Send + 'static,
     usize: From<<CF as CostFunction<L>>::Cost>,
 {
     pub fn new(
@@ -123,13 +124,9 @@ where
         //     .sum();
 
         // run extract
-        let best_cost = if self.lp_extract {
-            let expr = LpExtractor::new(&self.egraph, self.cf.clone()).solve(self.root_id);
-            expr.as_ref().len()
-        } else {
-            let (cost, _) = Extractor::new(&self.egraph, self.cf.clone()).find_best(self.root_id);
-            usize::try_from(cost).unwrap()
-        };
+        // let (cost, _) = Extractor::new(&self.egraph, self.cf.clone()).find_best(self.root_id);
+        let cost = Extractor::new(&self.egraph, self.cf.clone()).find_best_cost(self.root_id);
+        let best_cost = usize::try_from(cost).unwrap();
 
         // compute transition
         self.cnt += 1;
@@ -217,15 +214,19 @@ where
                 panic!("At least one child is already saturated. Should this ever happen?");
             }
 
-            // Create runner with egraph and make sure that it is clean
+            // Create runner with egraph
             let egraph = std::mem::take(&mut self.egraph);
             let mut runner = Runner::default().with_egraph(egraph);
-            runner.egraph.rebuild();
 
-            // Iterate over all single-pattern rewrite rules and check if the source pattern is found in the egraph
-            // If the source pattern is found, mark the child accordingly and increase the saturation counter of the environment
+            // If the runner is not clean, rebuild the egraph
+            if !runner.egraph.clean {
+                runner.egraph.rebuild();
+            }
+
+            // Iterate over all single-pattern rewrite rules and check if the source pattern is found at least once in the egraph. IMPORTANT: Search with limit, otherwise we get an OOM for larger egraphs!
+            // If the source pattern is not found, mark the child accordingly and increase the saturation counter of the environment
             for (i, rewrite) in self.rules.iter().enumerate() {
-                if rewrite.searcher.n_matches(&runner.egraph) == 0 {
+                if rewrite.searcher.search_with_limit(&runner.egraph, 1).len() == 0 {
                     if !children_saturated[i] {
                         children_saturated[i] = true;
                         self.sat_counter += 1;
