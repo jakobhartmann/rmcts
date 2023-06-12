@@ -6,73 +6,70 @@ use crate::tree::{ExpTask, SimTask};
 use egg::{
     Analysis, CostFunction, EGraph, Id, Language, LpCostFunction, RecExpr, Rewrite, StopReason,
 };
+use tensat::model::{Mdl, TensorAnalysis};
+use tensat::rewrites::MultiPatterns;
 use rand::{Rng};
 use rand::distributions::{WeightedIndex, Distribution};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
+use std::path::PathBuf;
 use itertools::izip;
 
-pub enum Message<L, N>
-where
-    L: Language + 'static + egg::FromOp + std::marker::Send + std::fmt::Display,
-    N: Analysis<L> + Clone + 'static + std::default::Default + std::marker::Send,
-    N::Data: Clone,
-    <N as Analysis<L>>::Data: Send,
-{
+pub enum Message {
     Exit,
     #[allow(unused_variables)]
     Nothing,
-    Expansion(ExpTask<L, N>, u32, u32),
-    Simulation(SimTask<L, N>, u32),
+    Expansion(ExpTask, u32, u32),
+    Simulation(SimTask, u32),
 }
 
-pub enum Reply<L, N>
-where
-    L: Language + 'static + egg::FromOp + std::marker::Send + std::fmt::Display,
-    N: Analysis<L> + Clone + 'static + std::default::Default + std::marker::Send,
-    N::Data: Clone,
-    <N as Analysis<L>>::Data: Send,
-{
+pub enum Reply {
     OK,
-    DoneExpansion(usize, (), f32, bool, bool, Vec<bool>, usize, Option<Ckpt<L, N>>, u32, u32),
+    DoneExpansion(usize, (), f32, bool, bool, Vec<bool>, usize, Option<Ckpt>, u32, u32),
     DoneSimulation(u32, f32),
 }
 
-pub fn worker_loop<L, N, CF>(
+pub fn worker_loop(
+    name: &'static str,
     id: usize,
     gamma: f32,
     max_sim_step: u32,
     verbose: bool,
-    egraph: EGraph<L, N>,
+    egraph: EGraph<Mdl, TensorAnalysis>,
     root_id: Id,
-    rules: Vec<Rewrite<L, N>>,
-    cf: CF,
-    lp_extract: bool,
+    rules: Vec<Rewrite<Mdl, TensorAnalysis>>,
+    multi_patterns: Option<MultiPatterns>,
+    all_weight_only: bool,
+    extraction: String,
     prune_actions: bool,
     rollout_strategy: String,
+    // egg
     node_limit: usize,
     time_limit: usize,
+    // ilp
+    order_var_int: bool,
+    class_constraint: bool,
+    no_order: bool,
+    initial_with_greedy: bool,
+    ilp_time_sec: usize,
+    ilp_num_threads: usize,
+    output_dir: PathBuf,
 ) -> (
     thread::JoinHandle<()>,
-    mpsc::Sender<Message<L, N>>,
-    mpsc::Receiver<Reply<L, N>>,
+    mpsc::Sender<Message>,
+    mpsc::Receiver<Reply>,
 )
-where
-    L: Language + 'static + egg::FromOp + std::marker::Send + std::fmt::Display,
-    N: Analysis<L> + Clone + 'static + std::default::Default + std::marker::Send,
-    N::Data: Clone,
-    <N as Analysis<L>>::Data: Send,
-    CF: CostFunction<L> + LpCostFunction<L, N> + Clone + std::marker::Send + 'static,
-    usize: From<<CF as CostFunction<L>>::Cost>,
 {
     let (tx, rx) = mpsc::channel();
     let (tx2, rx2) = mpsc::channel();
-    let handle = thread::spawn(move || {
+    let thread_identifier = name.to_owned() + "_" + id.to_string().as_str();
+    let builder = thread::Builder::new().name(thread_identifier.into());
+    let handle = builder.spawn(move || {
         // make env
         // let mut env = Env::new(expr, rules, node_limit, time_limit);
         let mut env = EgraphEnv::new(
-            egraph, root_id, rules, cf, lp_extract, prune_actions, node_limit, time_limit,
+            egraph, root_id, rules, multi_patterns, all_weight_only, extraction.clone(), prune_actions, node_limit, time_limit, order_var_int, class_constraint, no_order, initial_with_greedy, ilp_time_sec, ilp_num_threads, output_dir.clone()
         );
         // NOTE: Should this be reset at some point?
         let mut rewards = vec![0.0; env.get_action_space()];
@@ -158,34 +155,34 @@ where
                     let mut action_weights_heavy: Vec<f32> = vec![0.0; action_n]; // (reward / visit count) if the action will not lead to saturation
                     let mut epsilon = 0.0;
 
-                    if rollout_strategy.as_str() != "random" {
-                        action_weights_pruned = sim_task.children_saturated.clone().iter().map(|&x| {
-                            if x {
-                                0.0
-                            } else {
-                                1.0
-                            }
-                        }).collect();
-                    }
-
-                    let mut non_saturated_actions_visited = 0.0;
-                    if rollout_strategy.as_str() == "heavy" {
-                        // Only consider rewards of actions that do not lead to saturation
-                        for (visit_count, reward, saturated, action_weight) in izip!(&visit_counts, &rewards, &sim_task.children_saturated, &mut action_weights_heavy) {
-                            if !saturated && *visit_count > 0.0 {
-                                *action_weight = reward / visit_count;
-                                non_saturated_actions_visited += 1.0;
-                            }
-                        }
-
-                        // Max is necessary in case all actions lead to saturation
-                        epsilon = f32::max(non_saturated_actions_visited / ((action_n - sim_task.children_saturated_cnt) as f32), 0.0);
-                        // Epsilon = min((#non saturated actions with visit count > 0 / #non saturated actions); 0.75)
-                        epsilon = f32::min(epsilon, 0.75);
-                    }
-
                     // env loop
                     while !done {
+                        if rollout_strategy.as_str() != "random" {
+                            action_weights_pruned = sim_task.children_saturated.clone().iter().map(|&x| {
+                                if x {
+                                    0.0
+                                } else {
+                                    1.0
+                                }
+                            }).collect();
+                        }
+    
+                        let mut non_saturated_actions_visited = 0.0;
+                        if rollout_strategy.as_str() == "heavy" {
+                            // Only consider rewards of actions that do not lead to saturation
+                            for (visit_count, reward, saturated, action_weight) in izip!(&visit_counts, &rewards, &sim_task.children_saturated, &mut action_weights_heavy) {
+                                if !saturated && *visit_count > 0.0 {
+                                    *action_weight = reward / visit_count;
+                                    non_saturated_actions_visited += 1.0;
+                                }
+                            }
+    
+                            // Max is necessary in case all actions lead to saturation
+                            epsilon = f32::max(non_saturated_actions_visited / ((action_n - sim_task.children_saturated_cnt) as f32), 0.0);
+                            // Epsilon = min((#non saturated actions with visit count > 0 / #non saturated actions); 0.75)
+                            epsilon = f32::min(epsilon, 0.75);
+                        }
+                        
                         let action_weights = match rollout_strategy.as_str() {
                             // Random policy rollouts
                             "random" => {
@@ -214,6 +211,33 @@ where
                                 } else {
                                     action_weights_heavy.clone()
                                 }
+                            },
+                            "lookahead" => {
+                                // Make a copy of current env
+                                let env_checkpoint = env.checkpoint().clone();
+                                let lh_actions = rand::seq::index::sample(&mut rng, action_n, 5).into_vec();
+
+                                let mut best_action = std::usize::MAX;
+                                let mut best_reward = std::f32::MIN;
+
+                                for lh_action in lh_actions {
+                                    env.restore(env_checkpoint.clone());
+                                    (_state, reward, _, _info) = env.step(lh_action);
+
+                                    if reward > best_reward {
+                                        best_action = lh_action;
+                                        best_reward = reward;
+                                    }
+                                }
+
+                                env.restore(env_checkpoint);
+
+                                if best_action == std::usize::MAX {
+                                    panic!("Something went wrong with lookahead search");
+                                }
+                                let mut action_weights = vec![0.0; action_n];
+                                action_weights[best_action] = 1.0;
+                                action_weights
                             },
                             _ => {
                                 panic!("Unkown rollout strategy: {}", rollout_strategy);
@@ -259,5 +283,5 @@ where
         }
     });
 
-    (handle, tx, rx2)
+    (handle.unwrap(), tx, rx2)
 }

@@ -1,4 +1,6 @@
 #![allow(unused)]
+#![allow(unused_variables)]
+#![allow(unused_must_use)]
 
 mod eg_env;
 mod env;
@@ -10,18 +12,29 @@ mod workers;
 mod math;
 mod prop;
 mod utils;
+mod custom_models;
 
-use std::fs::create_dir_all;
+use std::fs::{create_dir_all, read_to_string};
 use std::path::Path;
 use std::time::Instant;
 use serde::{Serialize, Deserialize};
 use serde_json::{to_string, json};
+use clap::{App, Arg};
 
 use egg::*;
+use tensat::utils::{save_model, extract_by_ilp_rmcts};
+use tensat::model::{Mdl, TensorAnalysis};
+use tensat::optimize::{CostModel, TensorCost};
+use tensat::rewrites::MultiPatterns;
+use tensat::{bert, inceptionv3, mobilenetv2, nasneta, nasrnn, resnet50, resnext50, squeezenet, vgg};
 use crate::run::MCTSArgs;
-use crate::math::*;
-use crate::prop::*;
 use crate::utils::save_data_to_file;
+use crate::custom_models::{get_very_simple_model, get_simple_model, get_complex_model, get_complex_model2, get_suboptimal_model, get_138_model};
+
+use std::alloc;
+use cap::Cap;
+#[global_allocator]
+static ALLOCATOR: Cap<alloc::System> = Cap::new(alloc::System, usize::max_value());
 
 define_language! {
     enum SimpleLanguage {
@@ -47,7 +60,7 @@ fn make_rules() -> Vec<egg::Rewrite<SimpleLanguage, ()>> {
 pub struct AstSize;
 impl<L: Language> CostFunction<L> for AstSize {
     type Cost = usize;
-    fn cost<C>(&mut self, enode: &L, mut costs: C) -> Self::Cost
+    fn cost<C>(&mut self, enode: &L, mut costs: C, _eclass_id: Option<Id>) -> Self::Cost
     where
         C: FnMut(Id) -> Self::Cost,
     {
@@ -64,323 +77,320 @@ impl<L: Language, N: Analysis<L>> LpCostFunction<L, N> for AstSize {
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Settings {
-    // expression
-    domain: String,
-    expression_depth: u32,
-    expression_seed: u64,
-    // experiment tracking
-    experiments_base_path: String,
+    model: String, // Model to optimize
+    rules: String, // Provide a file with rewrite rules
+    multi_rules: String, // File with multi-pattern rules. Every two lines belong to one multi-pattern rule
+    save_graph: String, // all, io, none
+
+    n_sec: u64, // time_limit: Max number of seconds for egg to run
+    n_nodes: usize, // n_nodes: Max number of nodes for egraph
+    ilp_time_sec: usize, // Time limit for ILP solver (0 = no limit)
+    ilp_num_threads: usize, // Number of threads for ILP solver
+    node_multi: usize, // Max number of nodes added by multi-pattern rules
+    iter_multi: usize, // Max number of iterations to apply multi-pattern rules -> should always be 1 for RMCTS
+
+    export_models: bool, // Whether or not to store input and optimized model
+    use_multi: bool, // Set this flag will enable the use of multi-pattern rules
+    no_order: bool, // No ordering constraints in ILP
+    all_weight_only: bool, // Treat zero cost for all weight concat only
+    no_cycle: bool, // Not allowing cycles in EGraph
+
+    order_var_int: bool, // Set this flag will let ILP use integer var for ordering
+    class_constraint: bool, // Add constraint in ILP that each eclass sum to 1
+    initial_with_greedy: bool, // Initialize ILP with greedy solution
+    filter_before: bool, // Filter cycles before applying rules
+
     // mcts
     budget: u32,
     max_sim_step: u32,
     gamma: f32,
     expansion_worker_num: usize,
     simulation_worker_num: usize,
-    lp_extract: bool,
-    cost_threshold: usize,
+    extraction: String, // egg_greedy, egg_ilp, ilp, new_greedy?
+    final_extraction: String, // egg_greedy, egg_ilp, ilp, new_greedy?
+    cost_threshold: f32,
     iter_limit: usize,
     prune_actions: bool,
     rollout_strategy: String,
     subtree_caching: bool,
     select_max_uct_action: bool,
-    // egg
-    node_limit: usize,
-    time_limit: usize,
-}
 
-fn run_math_experiments (settings: Settings, run_egg: bool) {
-    // Create output dir
-    let experiment_name = settings.domain.clone() + "_" + &settings.expression_depth.to_string() + "_" + &settings.expression_seed.to_string();
-    let output_dir = Path::new(&settings.experiments_base_path).join(experiment_name);
-    if output_dir.exists() {
-        println!("You are overwriting existing data!");
-    } else {
-        create_dir_all(&output_dir);
-    }
-
-    // Save settings
-    save_data_to_file(&settings, &output_dir, "settings.txt");
-
-    // Generate and save expression
-    let start_expr = math::build_rand_expr(settings.expression_seed, settings.expression_depth);
-    save_data_to_file(&start_expr, &output_dir, "start_expr.txt");
-
-    // ### Start: egg ###
-    if run_egg {
-        // Create runner
-        let runner: Runner<Math, math::ConstantFold> = Runner::default()
-            .with_expr(&start_expr)
-            .with_iter_limit(settings.iter_limit)
-            .with_node_limit(settings.node_limit);
-        let root = runner.roots[0];
-
-        // Base cost
-        let extractor = Extractor::new(&runner.egraph, AstSize);
-        let (base_cost, _base_expr) = extractor.find_best(root);
-
-        // Run egg
-        let start_time = Instant::now();
-        let runner = runner.run(&math::rules());
-        let duration = start_time.elapsed();
-        runner.print_report();
-
-        // Best cost and expression
-        let extractor = Extractor::new(&runner.egraph, AstSize);
-        let (egg_cost, egg_expr) = extractor.find_best(root);
-        println!("Simplified expression {} to {} with base_cost {} -> cost {}", start_expr, egg_expr, base_cost, egg_cost);
-
-        // Save best expression, iteration data and runner report
-        save_data_to_file(&egg_expr, &output_dir, "egg_expr.txt");
-        save_data_to_file(&runner.iterations, &output_dir, "egg_iteration_data.txt");
-        save_data_to_file(&runner.report(), &output_dir, "egg_runner_report.txt");
-
-        // Save stats
-        let egg_stats = json!({
-            "base_cost": base_cost,
-            "best_cost": egg_cost,
-            "optimization_time": duration,
-        });
-        save_data_to_file(&egg_stats, &output_dir, "egg_stats.txt");
-    }
-    // ### End: egg ###
-    
-
-    // ### Start: MCTS ###
-    let args = MCTSArgs {
-        // mcts
-        budget: settings.budget,
-        max_sim_step: settings.max_sim_step,
-        gamma: settings.gamma,
-        expansion_worker_num: settings.expansion_worker_num,
-        simulation_worker_num: settings.simulation_worker_num,
-        lp_extract: settings.lp_extract,
-        cost_threshold: settings.cost_threshold,
-        iter_limit: settings.iter_limit,
-        prune_actions: settings.prune_actions,
-        rollout_strategy: settings.rollout_strategy,
-        subtree_caching: settings.subtree_caching,
-        select_max_uct_action: settings.select_max_uct_action,
-        // experiment tracking
-        output_dir: output_dir,
-        // egg
-        node_limit: settings.node_limit,
-        time_limit: settings.time_limit,
-    };
-
-    let runner = Runner::default().with_expr(&start_expr);
-    let root = runner.roots[0];
-    run::run_mcts(runner.egraph, root, math::rules(), AstSize, Some(args));
-}
-
-fn run_prop_experiments(settings: Settings, run_egg: bool) {
-    // Create output dir
-    let experiment_name = settings.domain.clone() + "_" + &settings.expression_depth.to_string() + "_" + &settings.expression_seed.to_string();
-    let output_dir = Path::new(&settings.experiments_base_path).join(experiment_name);
-    if output_dir.exists() {
-        println!("You are overwriting existing data!");
-    } else {
-        create_dir_all(&output_dir);
-    }
-
-    // Save settings
-    save_data_to_file(&settings, &output_dir, "settings.txt");
-
-    // Generate and save expression
-    let start_expr = prop::build_rand_expr(settings.expression_seed, settings.expression_depth);
-    save_data_to_file(&start_expr, &output_dir, "start_expr.txt");
-
-    // ### Start: egg ###
-    if run_egg {
-        // Create runner
-        let runner: Runner<Prop, prop::ConstantFold> = Runner::default()
-            .with_expr(&start_expr)
-            .with_iter_limit(settings.iter_limit)
-            .with_node_limit(settings.node_limit);
-        let root = runner.roots[0];
-
-        // Base cost
-        let extractor = Extractor::new(&runner.egraph, AstSize);
-        let (base_cost, _base_expr) = extractor.find_best(root);
-
-        // Run egg
-        let start_time = Instant::now();
-        let runner = runner.run(&prop::rules());
-        let duration = start_time.elapsed();
-        runner.print_report();
-
-        // Best cost and expression
-        let extractor = Extractor::new(&runner.egraph, AstSize);
-        let (egg_cost, egg_expr) = extractor.find_best(root);
-        println!("Simplified expression {} to {} with base_cost {} -> cost {}", start_expr, egg_expr, base_cost, egg_cost);
-
-        // Save best expression, iteration data and runner report
-        save_data_to_file(&egg_expr, &output_dir, "egg_expr.txt");
-        save_data_to_file(&runner.iterations, &output_dir, "egg_iteration_data.txt");
-        save_data_to_file(&runner.report(), &output_dir, "egg_runner_report.txt");
-
-        // Save stats
-        let egg_stats = json!({
-            "base_cost": base_cost,
-            "best_cost": egg_cost,
-            "optimization_time": duration,
-        });
-        save_data_to_file(&egg_stats, &output_dir, "egg_stats.txt");
-    }
-    // ### End: egg ###
-    
-
-    // ### Start: MCTS ###
-    let args = MCTSArgs {
-        // mcts
-        budget: settings.budget,
-        max_sim_step: settings.max_sim_step,
-        gamma: settings.gamma,
-        expansion_worker_num: settings.expansion_worker_num,
-        simulation_worker_num: settings.simulation_worker_num,
-        lp_extract: settings.lp_extract,
-        cost_threshold: settings.cost_threshold,
-        iter_limit: settings.iter_limit,
-        prune_actions: settings.prune_actions,
-        rollout_strategy: settings.rollout_strategy,
-        subtree_caching: settings.subtree_caching,
-        select_max_uct_action: settings.select_max_uct_action,
-        // experiment tracking
-        output_dir: output_dir,
-        // egg
-        node_limit: settings.node_limit,
-        time_limit: settings.time_limit,
-    };
-
-    let runner = Runner::default().with_expr(&start_expr);
-    let root = runner.roots[0];
-    run::run_mcts(runner.egraph, root, prop::rules(), AstSize, Some(args));
+    // experiment tracking
+    seed: usize,
+    experiments_base_path: String,
 }
 
 fn main() {
+    // Read cmd arguments
+    let args = App::new("tensor-rmcts")
+        .arg(
+            Arg::with_name("model")
+                .long("model")
+                .takes_value(true)
+                .default_value("138_model")
+                .help("Model to optimize"),
+        )
+        .arg(
+            Arg::with_name("seed")
+                .long("seed")
+                .takes_value(true)
+                .default_value("0")
+                .help("Seed for this experiment"),
+        )
+        .arg(
+            Arg::with_name("extraction")
+                .long("extraction")
+                .takes_value(true)
+                .default_value("new_greedy")
+                .help("Main extraction method"),
+        )
+        .arg(
+            Arg::with_name("final_extraction")
+                .long("final_extraction")
+                .takes_value(true)
+                .default_value("tensat_ilp")
+                .help("Final extraction method"),
+        )
+        .get_matches();
+
+    // Set memory limit to prevent system-wide OOM
+    ALLOCATOR.set_limit(50 * 1024 * 1024 * 1024).unwrap();
+    println!("Memory limit: {}B", ALLOCATOR.limit());
+
     let mut settings = Settings {
-        // expression
-        domain: String::from("prop"),
-        expression_depth: 10,
-        expression_seed: 0,
-        // experiment tracking
-        experiments_base_path: String::from("/usr/experiments/prop/"),
+        model: String::from("resnet50"),
+        rules: String::from("/usr/tensat/converted.txt"),
+        multi_rules: String::from("/usr/tensat/converted_multi.txt"),
+        save_graph: String::from("all"),
+
+        n_sec: 10,
+        n_nodes: 2_000,
+        ilp_time_sec: 600,
+        ilp_num_threads: 1,
+        node_multi: 2_000,
+        iter_multi: 1,
+
+        export_models: true,
+        use_multi: true,
+        no_order: true,
+        all_weight_only: true,
+        no_cycle: true,
+
+        filter_before: false,
+        order_var_int: false,
+        class_constraint: false,
+        initial_with_greedy: false,
+
         // mcts
-        budget: 512,
+        budget: 128,
         max_sim_step: 10,
-        gamma: 0.99,
+        gamma: 0.99, // used in rmcts?
         expansion_worker_num: 1,
         simulation_worker_num: 1,
-        lp_extract: false,
-        cost_threshold: 1,
-        iter_limit: 100,
-        prune_actions: false,
-        rollout_strategy: String::from("random"),
+        extraction: String::from("new_greedy"),
+        final_extraction: String::from("tensat_ilp"),
+        cost_threshold: 0.1,
+        iter_limit: 200,
+        prune_actions: true,
+        rollout_strategy: String::from("heavy"),
         subtree_caching: false,
         select_max_uct_action: true,
-        // egg
-        node_limit: 5_000,
-        time_limit: 1,
+
+        // experiment tracking
+        seed: 0,
+        experiments_base_path: String::from("/usr/experiments/rmcts/"),
     };
 
-    // Experiment 1: egg vs. rmcts
-    let expressions_seeds = vec![0, 1, 2, 3, 4];
-    let node_limits = vec![5_000, 10_000];
-    let mut settings1 = settings.clone();
+    // // Experiment: extraction methods (egg_greedy, new_greedy, tensat_ilp)
+    let seed = args
+        .value_of("seed")
+        .unwrap()
+        .parse::<usize>()
+        .unwrap();
+    settings.seed = seed;
 
-    for seed in &expressions_seeds {    
-        for node_limit in &node_limits {
-            settings1.expression_seed = *seed;
-            settings1.node_limit = *node_limit;
-            settings1.experiments_base_path = String::from("/usr/experiments/prop/egg_vs_rmcts/".to_owned() + &node_limit.to_string());
-            run_prop_experiments(settings1.clone(), true);
-        }
+    let model = args
+        .value_of("model")
+        .unwrap()
+        .parse::<String>()
+        .unwrap();
+    settings.model = model.clone();
+
+    let extraction = args
+        .value_of("extraction")
+        .unwrap()
+        .parse::<String>()
+        .unwrap();
+    settings.extraction = extraction.clone();
+
+    let final_extraction = args
+        .value_of("final_extraction")
+        .unwrap()
+        .parse::<String>()
+        .unwrap();
+    settings.final_extraction = final_extraction.clone();
+
+    settings.experiments_base_path = String::from("/usr/experiments/rmcts/tests/simple_example");
+
+    if model == String::from("nasrnn") {
+        settings.multi_rules = String::from("/usr/tensat/converted_multi_nasrnn.txt");
+    } else {
+        settings.multi_rules = String::from("/usr/tensat/converted_multi.txt");
+    }
+    
+    optimize(settings);
+
+    // test_extractor();
+}
+
+fn test_extractor() {
+    let model = String::from("138_model");
+
+    let expr = match model.as_str() {
+        "resnet50" => resnet50::get_resnet50(),
+        "nasrnn" => nasrnn::get_nasrnn(),
+        "resnext50" => resnext50::get_resnext50(),
+        "bert" => bert::get_bert(),
+        "nasneta" => nasneta::get_nasneta(),
+        "inceptionv3" => inceptionv3::get_inceptionv3(),
+        "mobilenetv2" => mobilenetv2::get_mobilenetv2(),
+        "vgg" => vgg::get_vgg(),
+        "squeezenet" => squeezenet::get_squeezenet(),
+        "simple_example" => get_simple_model(),
+        "complex_example" => get_complex_model(),
+        "complex_example2" => get_complex_model2(),
+        "suboptimal" => get_suboptimal_model(),
+        "138_model" => get_138_model(),
+        _ => panic!("The model name is not supported"),
+    };
+
+    let mut runner: Runner<Mdl, TensorAnalysis> = Runner::default().with_expr(&expr);
+    let root = runner.roots[0];
+
+    assert!(&runner.egraph.total_size() == &runner.egraph.number_of_classes());
+
+    // save_model(&runner, "/usr/rmcts/suboptimal_model.model");
+    // &runner.egraph.dot().to_svg("/usr/rmcts/suboptimal_model.svg").unwrap();
+
+    let cost_model: CostModel = tensat::optimize::CostModel::with_setting(true);
+    let mut tnsr_cost: TensorCost = tensat::optimize::TensorCost::new(&runner.egraph, &cost_model, true);
+
+    // TENSAT ILP
+    let ilp_dir = Path::new("/usr/experiments/rmcts/tests/").join("ilp").into_os_string().into_string().unwrap();
+    let (expr, cost, duration) = extract_by_ilp_rmcts(&runner.egraph, root, &cost_model, false, false, true, false, 600, 1, ilp_dir, false);
+    println!("TENSAT ILP base cost: {}, duration: {}", cost, duration);
+
+    // Egg ILP
+    let now = Instant::now();
+    let (base_cost, best_expr) = LpExtractor::new(&runner.egraph, tnsr_cost.clone()).solve(root);
+    println!("Egg ILP base cost: {}, duration: {}", base_cost, now.elapsed().as_millis());
+
+    // Default greedy
+    let now = Instant::now();
+    let extractor = Extractor::new(&runner.egraph, tnsr_cost);
+    let (base_cost, best_expr) = extractor.find_best(root);
+    println!("Egg greedy base cost: {}, duration: {}", base_cost, now.elapsed().as_millis());
+
+    // Fixed greedy
+    let mut tnsr_cost: TensorCost = tensat::optimize::TensorCost::new(&runner.egraph, &cost_model, false);
+    let now = Instant::now();
+    let extractor = Extractor::new(&runner.egraph, tnsr_cost);
+    let (base_cost, best_expr) = extractor.find_best(root);
+    println!("New greedy base cost: {}, duration: {}", base_cost, now.elapsed().as_millis());
+}
+
+fn optimize(settings: Settings) {
+    let filter_after = !settings.filter_before; // filter cycles after applying rewrite rules
+
+    let output_dir = Path::new(&settings.experiments_base_path).join(settings.model.clone() + "_" + &settings.seed.to_string());
+
+    let expr = match settings.model.as_str() {
+        "resnet50" => resnet50::get_resnet50(),
+        "nasrnn" => nasrnn::get_nasrnn(),
+        "resnext50" => resnext50::get_resnext50(),
+        "bert" => bert::get_bert(),
+        "nasneta" => nasneta::get_nasneta(),
+        "inceptionv3" => inceptionv3::get_inceptionv3(),
+        "mobilenetv2" => mobilenetv2::get_mobilenetv2(),
+        "vgg" => vgg::get_vgg(),
+        "squeezenet" => squeezenet::get_squeezenet(),
+        "very_simple_example" => get_very_simple_model(),
+        "simple_example" => get_simple_model(),
+        "complex_example" => get_complex_model(),
+        "complex_example2" => get_complex_model2(),
+        "suboptimal" => get_suboptimal_model(),
+        "138_model" => get_138_model(),
+        _ => panic!("The model name is not supported"),
+    };
+
+    // Load single learned and pre-defined TASO rules
+    let learned_rules = read_to_string(settings.rules.clone()).expect("Something went wrong reading the rule file");
+    let pre_defined_rules = tensat::rewrites::PRE_DEFINED_RULES.iter().map(|&x| x);
+    let split_rules: Vec<&str> = learned_rules.split("\n").chain(pre_defined_rules).collect();
+    let do_filter_after = settings.no_cycle && filter_after;
+    let rules = tensat::rewrites::rules_from_str(split_rules, do_filter_after);
+    println!("#Single-pattern rewrite rules: {}", rules.len());
+
+    // Load multi learned and pre-defined TASO rules
+    let multi_patterns = if settings.use_multi {
+        let learned_multi_rules = read_to_string(settings.multi_rules.clone()).expect("Something went wrong reading the multi rule file");
+        let pre_defined_multi_rules = tensat::rewrites::PRE_DEFINED_MULTI.iter().map(|&x| (x, false));
+        let multi_rules: Vec<(&str, bool)> = learned_multi_rules.split("\n").map(|x| (x, true)).chain(pre_defined_multi_rules).collect();
+        let multi_patterns = MultiPatterns::with_rules(multi_rules.clone(), settings.no_cycle, settings.iter_multi, filter_after, settings.node_multi, settings.n_sec, String::new());
+        println!("#Multi-pattern rewritue rules: {}", multi_patterns.rules.len());
+        Some(multi_patterns)
+    } else {
+        println!("Multi-pattern rewrite rules will not be used!");
+        None
+    };
+
+    // RMCTS args
+    let n_threads = std::thread::available_parallelism().unwrap().get();
+    let args = MCTSArgs {
+        // mcts
+        budget: settings.budget,
+        max_sim_step: settings.max_sim_step,
+        gamma: settings.gamma,
+        expansion_worker_num: settings.expansion_worker_num,
+        simulation_worker_num: settings.simulation_worker_num,
+        all_weight_only: settings.all_weight_only,
+        extraction: settings.extraction.clone(),
+        final_extraction: settings.final_extraction.clone(),
+        cost_threshold: settings.cost_threshold,
+        iter_limit: settings.iter_limit,
+        prune_actions: settings.prune_actions,
+        rollout_strategy: settings.rollout_strategy.clone(),
+        subtree_caching: settings.subtree_caching,
+        select_max_uct_action: settings.select_max_uct_action,
+        // egg
+        node_limit: settings.n_nodes,
+        time_limit: settings.n_sec as usize,
+        // experiment tracking
+        output_dir: output_dir.clone(),
+        save_graph: settings.save_graph.clone(),
+        export_models: settings.export_models,
+        // tensat ilp
+        order_var_int: settings.order_var_int,
+        class_constraint: settings.class_constraint,
+        no_order: settings.no_order,
+        initial_with_greedy: settings.initial_with_greedy,
+        ilp_time_sec: settings.ilp_time_sec,
+        ilp_num_threads: settings.ilp_num_threads,
+    };
+
+    // Warn if output directory already exists, otherwise create it
+    if output_dir.exists() {
+        println!("You are overwriting existing data!");
+    } else {
+        create_dir_all(&output_dir);
     }
 
-    // Experiment 2: subtree caching and action selection strategy
-    let subtree_caching_options = vec![false, true];
-    let action_select_strategies = vec![false, true];
-    let expressions_seeds = vec![0, 1, 2, 3, 4];
-    let mut settings2 = settings.clone();
+    // Save settings to file
+    save_data_to_file(&settings, &output_dir, "settings.txt");
 
-    for seed in &expressions_seeds {
-        for option in &subtree_caching_options {
-            for strategy in &action_select_strategies {
-                settings2.expression_seed = *seed;
-                settings2.subtree_caching = *option;
-                settings2.select_max_uct_action = *strategy;
-                settings2.experiments_base_path = String::from("/usr/experiments/prop/subtree_caching/".to_owned() + &option.to_string() + "/" + &strategy.to_string());
-                run_prop_experiments(settings2.clone(), true);
-            }
-        }
-    }
+    // Init runner to avoid CUDNN/CUDA errors and to get egraph and root id
+    let runner = Runner::<Mdl, TensorAnalysis, ()>::default().with_expr(&expr);
+    let root = runner.roots[0];
 
-    // Experiment 3: rmcts with and without action pruning
-    let expressions_seeds = vec![0, 1, 2, 3, 4];
-    let experiments = vec![(false, String::from("random")), (true, String::from("pruning")), (true, String::from("heavy"))];
-    let mut settings3 = settings.clone();
-
-    for experiment in &experiments {
-        for seed in &expressions_seeds {
-            let (prune_actions, rollout_strategy) = experiment;
-            settings3.expression_seed = *seed;
-            settings3.prune_actions = *prune_actions;
-            settings3.rollout_strategy = rollout_strategy.clone();
-            settings3.experiments_base_path = String::from("/usr/experiments/prop/pruning/".to_owned() + &prune_actions.to_string() + "_" + &rollout_strategy.to_owned());
-            run_prop_experiments(settings3.clone(), true);
-        }
-    }
-
-    // Experiment 4: rmcts with different budgets
-    let expressions_seeds = vec![0, 1, 2, 3, 4];
-    let budgets = vec![64, 128, 256, 512, 1024];
-    let mut settings4 = settings.clone();
-
-    for budget in &budgets {
-        for seed in &expressions_seeds {
-            settings4.expression_seed = *seed;
-            settings4.budget = *budget;
-            settings4.experiments_base_path = String::from("/usr/experiments/prop/budget/".to_owned() + &budget.to_string());
-            run_prop_experiments(settings4.clone(), true);
-        }
-    }
-
-    // Experiment 5: rmcts with different simulation depths
-    let expressions_seeds = vec![0, 1, 2, 3, 4];
-    let max_sim_steps = vec![5, 10, 15];
-    let mut settings5 = settings.clone();
-
-    for max_sim_step in &max_sim_steps {
-        for seed in &expressions_seeds {
-            settings5.expression_seed = *seed;
-            settings5.max_sim_step = *max_sim_step;
-            settings5.experiments_base_path = String::from("/usr/experiments/prop/simulation_depth/".to_owned() + &max_sim_step.to_string());
-            run_prop_experiments(settings5.clone(), true);
-        }
-    }
-
-    // let args = MCTSArgs {
-    //     // mcts
-    //     budget: 12,
-    //     max_sim_step: 10,
-    //     gamma: 0.99,
-    //     expansion_worker_num: 1,
-    //     simulation_worker_num: 1,
-    //     lp_extract: false,
-    //     cost_threshold: 1,
-    //     iter_limit: 100,
-    //     prune_actions: true,
-    //     rollout_strategy: String::from("heavy"), // random, pruning, heavy (if pruning is chosen, prune actions has to be set to true, otherwise it has no effect)
-    //     subtree_caching: true,
-    //     select_max_uct_action: false,
-    //     // experiment tracking
-    //     output_dir: Path::new("/usr/experiments/tests/").to_path_buf(),
-    //     // egg
-    //     node_limit: 10_000,
-    //     time_limit: 1,
-    // };
-
-    // let expr = "(* (* 0 42) 1)".parse().unwrap();
-    // let runner = Runner::default().with_expr(&expr);
-    // let root = runner.roots[0];
-    // run::run_mcts(runner.egraph, root, make_rules(), AstSize, Some(args));
+    run::run_mcts(runner.egraph, root, rules, multi_patterns, Some(args));
 }

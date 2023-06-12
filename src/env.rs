@@ -7,7 +7,7 @@ use std::time::Duration;
 
 pub struct Info {
     pub report: Report,
-    pub best_cost: usize,
+    pub best_cost: f32,
 }
 
 #[allow(dead_code)]
@@ -22,8 +22,8 @@ pub struct Env<L: Language, N: Analysis<L>> {
     node_limit: usize,
     time_limit: std::time::Duration,
 
-    pub base_cost: usize,
-    pub last_cost: usize,
+    pub base_cost: f32,
+    pub last_cost: f32,
     cnt: u32,
     sat_counter: usize,
 }
@@ -44,6 +44,7 @@ where
         // get base
         let runner: Runner<L, N> = Runner::default().with_expr(&expr);
         let (base_cost, _) = Extractor::new(&runner.egraph, AstSize).find_best(runner.roots[0]);
+        let base_cost = base_cost as f32;
         Env {
             action_history: Vec::new(),
             expr: expr,
@@ -95,6 +96,7 @@ where
         // run extract
         let extractor = Extractor::new(&self.egraph, AstSize);
         let (best_cost, _) = extractor.find_best(self.root_id);
+        let best_cost = best_cost as f32;
 
         // compute transition
         self.cnt += 1;
@@ -118,7 +120,8 @@ where
             StopReason::IterationLimit(_) => self.sat_counter = 0,
             _ => self.sat_counter = 0,
         }
-        let reward = std::cmp::max(self.last_cost - best_cost, 0); // TODO allow callback cost func
+        // let reward = std::cmp::max(self.last_cost - best_cost, 0); // TODO allow callback cost func
+        let reward = f32::max(self.last_cost - best_cost, 0.0);
         self.last_cost = best_cost;
         let info = Info {
             report: report,

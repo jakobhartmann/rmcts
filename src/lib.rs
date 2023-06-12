@@ -7,3 +7,4 @@ mod tree;
 mod workers;
 mod math;
 mod utils;
+mod custom_models;

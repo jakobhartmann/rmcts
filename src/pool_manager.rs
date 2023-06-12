@@ -3,9 +3,11 @@ use crate::workers::{worker_loop, Message, Reply};
 
 #[allow(unused_imports)]
 use egg::{Analysis, CostFunction, EGraph, Id, Language, LpCostFunction, RecExpr, Rewrite};
-use std::marker::PhantomData;
+use tensat::model::{Mdl, TensorAnalysis};
+use tensat::rewrites::MultiPatterns;
 use std::sync::mpsc::{Receiver, Sender};
 use std::thread;
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Status {
@@ -13,15 +15,7 @@ enum Status {
     Idle,
 }
 
-pub struct PoolManager<L, N, CF>
-where
-    L: Language + 'static + egg::FromOp + std::marker::Send + std::fmt::Display,
-    N: Analysis<L> + Clone + 'static + std::default::Default + std::marker::Send,
-    N::Data: Clone,
-    <N as Analysis<L>>::Data: Send,
-    CF: CostFunction<L> + LpCostFunction<L, N> + Clone + std::marker::Send + 'static,
-    usize: From<<CF as CostFunction<L>>::Cost>,
-{
+pub struct PoolManager {
     #[allow(unused_variables, dead_code)]
     name: &'static str,
     work_num: usize,
@@ -29,20 +23,11 @@ where
     // self
     workers: Vec<thread::JoinHandle<()>>,
     worker_status: Vec<Status>,
-    txs: Vec<Sender<Message<L, N>>>,
-    rxs: Vec<Receiver<Reply<L, N>>>,
-    d: PhantomData<CF>,
+    txs: Vec<Sender<Message>>,
+    rxs: Vec<Receiver<Reply>>,
 }
 
-impl<L, N, CF> PoolManager<L, N, CF>
-where
-    L: Language + 'static + egg::FromOp + std::marker::Send + std::fmt::Display,
-    N: Analysis<L> + Clone + 'static + std::default::Default + std::marker::Send,
-    N::Data: Clone,
-    <N as Analysis<L>>::Data: Send,
-    CF: CostFunction<L> + LpCostFunction<L, N> + Clone + std::marker::Send + 'static,
-    usize: From<<CF as CostFunction<L>>::Cost>,
-{
+impl PoolManager {
     pub fn new(
         // mcts
         name: &'static str,
@@ -50,16 +35,25 @@ where
         gamma: f32,
         max_sim_step: u32,
         verbose: bool,
-        egraph: EGraph<L, N>,
+        egraph: EGraph<Mdl, TensorAnalysis>,
         id: Id,
-        rules: Vec<Rewrite<L, N>>,
-        cf: CF,
-        lp_extract: bool,
+        rules: Vec<Rewrite<Mdl, TensorAnalysis>>,
+        multi_patterns: Option<MultiPatterns>,
+        all_weight_only: bool,
+        extraction: String,
         prune_actions: bool,
         rollout_strategy: String,
         // egg
         node_limit: usize,
         time_limit: usize,
+        // ilp
+        order_var_int: bool,
+        class_constraint: bool,
+        no_order: bool,
+        initial_with_greedy: bool,
+        ilp_time_sec: usize,
+        ilp_num_threads: usize,
+        output_dir: PathBuf,
     ) -> Self {
         // build workers
         let mut workers = Vec::new();
@@ -67,6 +61,7 @@ where
         let mut rxs = Vec::new();
         for i in 0..work_num {
             let (w, tx, rx) = worker_loop(
+                name,
                 i,
                 gamma,
                 max_sim_step,
@@ -74,12 +69,20 @@ where
                 egraph.clone(),
                 id.clone(),
                 rules.clone(),
-                cf.clone(),
-                lp_extract,
+                multi_patterns.clone(),
+                all_weight_only,
+                extraction.clone(),
                 prune_actions,
                 rollout_strategy.clone(),
                 node_limit,
                 time_limit,
+                order_var_int,
+                class_constraint,
+                no_order,
+                initial_with_greedy,
+                ilp_time_sec,
+                ilp_num_threads,
+                output_dir.clone(),
             );
             workers.push(w);
             txs.push(tx);
@@ -93,7 +96,6 @@ where
             worker_status: vec![Status::Idle; work_num],
             txs: txs,
             rxs: rxs,
-            d: PhantomData,
         }
     }
 
@@ -103,7 +105,7 @@ where
 
     pub fn assign_expansion_task(
         &mut self,
-        exp_task: ExpTask<L, N>,
+        exp_task: ExpTask,
         global_saving_idx: u32,
         task_idx: u32,
     ) {
@@ -113,7 +115,7 @@ where
             .unwrap();
     }
 
-    pub fn assign_simulation_task(&mut self, sim_task: SimTask<L, N>, task_idx: u32) {
+    pub fn assign_simulation_task(&mut self, sim_task: SimTask, task_idx: u32) {
         let id = self.find_idle_worker();
         self.txs[id]
             .send(Message::Simulation(sim_task, task_idx))
@@ -147,7 +149,7 @@ where
             / (self.work_num as f32)
     }
 
-    pub fn get_complete_task(&mut self) -> Reply<L, N> {
+    pub fn get_complete_task(&mut self) -> Reply {
         loop {
             for i in 0..self.work_num {
                 let reply = self.rxs[i].try_recv(); // non-blocking

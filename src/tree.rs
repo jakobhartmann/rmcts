@@ -8,7 +8,11 @@ use crate::workers::Reply;
 use crate::utils::save_data_to_file;
 
 #[allow(unused_imports)]
-use egg::{Analysis, CostFunction, EGraph, Id, Language, LpCostFunction, RecExpr, Rewrite, Extractor};
+use egg::{Analysis, CostFunction, EGraph, Id, Language, LpCostFunction, RecExpr, Rewrite, Extractor, LpExtractor, Runner};
+use tensat::model::{Mdl, TensorAnalysis};
+use tensat::utils::{save_model, extract_by_ilp_rmcts, get_full_graph_runtime};
+use tensat::optimize::{CostModel, TensorCost};
+use tensat::rewrites::MultiPatterns;
 use rand::Rng;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -17,102 +21,85 @@ use std::marker::PhantomData;
 use std::rc::Rc;
 use std::thread;
 use std::time::{Duration, Instant};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use serde_json::json;
 // use log::info;
 
-pub struct ExpTask<L, N>
-where
-    L: Language + 'static + egg::FromOp + std::marker::Send + std::fmt::Display,
-    N: Analysis<L> + Clone + 'static + std::default::Default + std::marker::Send,
-    N::Data: Clone,
-    <N as Analysis<L>>::Data: Send,
-{
+pub struct ExpTask {
     // pub checkpoint_data: Vec<usize>,
-    pub checkpoint_data: Ckpt<L, N>,
+    pub checkpoint_data: Ckpt,
     pub shallow_copy_node: NodeStub,
-    d1: PhantomData<L>,
-    d2: PhantomData<N>,
+    d1: PhantomData::<Mdl>,
+    d2: PhantomData::<TensorAnalysis>,
 }
 
 #[derive(Clone)]
-pub struct SimTask<L, N>
-where
-    L: Language + 'static + egg::FromOp + std::marker::Send + std::fmt::Display,
-    N: Analysis<L> + Clone + 'static + std::default::Default + std::marker::Send,
-    N::Data: Clone,
-    <N as Analysis<L>>::Data: Send,
-{
-    pub checkpoint_data: Ckpt<L, N>,
+pub struct SimTask {
+    pub checkpoint_data: Ckpt,
     pub action: usize,
     pub saving_idx: u32,
     pub action_applied: bool,
     pub child_saturated: bool,
     pub children_saturated: Vec<bool>,
     pub children_saturated_cnt: usize,
-    d1: PhantomData<L>,
-    d2: PhantomData<N>,
+    d1: PhantomData::<Mdl>,
+    d2: PhantomData::<TensorAnalysis>,
 }
 
-pub struct Tree<L, N, CF>
-where
-    L: Language + 'static + egg::FromOp + std::marker::Send + std::fmt::Display,
-    N: Analysis<L> + Clone + 'static + std::default::Default + std::marker::Send,
-    N::Data: Clone,
-    <N as Analysis<L>>::Data: Send,
-    CF: CostFunction<L> + LpCostFunction<L, N> + Clone + std::marker::Send + 'static,
-    usize: From<<CF as CostFunction<L>>::Cost>,
-{
+pub struct Tree {
     // from param
     budget: u32,
     gamma: f32,
 
     // data and concurrency
-    exp_pool: pool_manager::PoolManager<L, N, CF>,
-    sim_pool: pool_manager::PoolManager<L, N, CF>,
+    exp_pool: pool_manager::PoolManager,
+    sim_pool: pool_manager::PoolManager,
     // ckpts: HashMap<u32, Vec<usize>>,
-    ckpts: HashMap<u32, Ckpt<L, N>>,
-    ckpts_old: HashMap<u32, Ckpt<L, N>>,
-    cf: CF,
-    lp_extract: bool,
+    ckpts: HashMap<u32, Ckpt>,
+    ckpts_old: HashMap<u32, Ckpt>,
+    all_weight_only: bool,
+    extraction: String,
+    final_extraction: String,
 
     prune_actions: bool,
     // rollout_strategy: String,
     subtree_caching: bool,
     select_max_uct_action: bool,
 
-    // experiment tracking
-    output_dir: PathBuf,
-
     // for planning
     root_node: Rc<RefCell<Node>>,
     best_child_node: Option<Rc<RefCell<Node>>>,
     global_saving_idx: u32,
     simulation_count: u32,
-    expansion_tasks: HashMap<u32, ExpTask<L, N>>,
+    expansion_tasks: HashMap<u32, ExpTask>,
     expansion_nodes_copy: HashMap<u32, Rc<RefCell<Node>>>,
-    simulation_tasks: HashMap<u32, SimTask<L, N>>,
+    simulation_tasks: HashMap<u32, SimTask>,
     simulation_nodes_copy: HashMap<u32, Rc<RefCell<Node>>>,
     pending_expansion_tasks: VecDeque<u32>,
     pending_simulation_tasks: VecDeque<u32>,
 
-    d1: PhantomData<L>,
-    d2: PhantomData<N>,
+    d1: PhantomData::<Mdl>,
+    d2: PhantomData::<TensorAnalysis>,
 
     // egg
     node_limit: usize,
     time_limit: usize,
+
+    // experiment tracking
+    output_dir: PathBuf,
+    save_graph: String,
+    export_models: bool,
+
+    // ilp
+    order_var_int: bool,
+    class_constraint: bool,
+    no_order: bool,
+    initial_with_greedy: bool,
+    ilp_time_sec: usize,
+    ilp_num_threads: usize,
 }
 
-impl<L, N, CF> Tree<L, N, CF>
-where
-    L: Language + 'static + egg::FromOp + std::marker::Send + std::fmt::Display,
-    N: Analysis<L> + Clone + 'static + std::default::Default + std::marker::Send,
-    N::Data: Clone,
-    <N as Analysis<L>>::Data: Send,
-    CF: CostFunction<L> + LpCostFunction<L, N> + Clone + std::marker::Send + 'static,
-    usize: From<<CF as CostFunction<L>>::Cost>,
-{
+impl Tree {
     pub fn new(
         // mcts
         budget: u32,
@@ -124,16 +111,27 @@ where
         rollout_strategy: String,
         subtree_caching: bool,
         select_max_uct_action: bool,
-        // experiment tracking
-        output_dir: PathBuf,
         // egg
-        egraph: EGraph<L, N>,
+        egraph: EGraph<Mdl, TensorAnalysis>,
         id: Id,
-        rules: Vec<Rewrite<L, N>>,
-        cf: CF,
-        lp_extract: bool,
+        rules: Vec<Rewrite<Mdl, TensorAnalysis>>,
+        multi_patterns: Option<MultiPatterns>,
+        all_weight_only: bool,
+        extraction: String,
+        final_extraction: String,
         node_limit: usize,
         time_limit: usize,
+        // experiment tracking
+        output_dir: PathBuf,
+        save_graph: String,
+        export_models: bool,
+        // ilp
+        order_var_int: bool,
+        class_constraint: bool,
+        no_order: bool,
+        initial_with_greedy: bool,
+        ilp_time_sec: usize,
+        ilp_num_threads: usize,
     ) -> Self {
         assert_eq!(expansion_worker_num, 1); // more than 1 expansion may have problem
         Tree {
@@ -149,12 +147,21 @@ where
                 egraph.clone(),
                 id.clone(),
                 rules.clone(),
-                cf.clone(),
-                lp_extract,
+                multi_patterns.clone(),
+                all_weight_only,
+                extraction.clone(),
                 prune_actions,
                 rollout_strategy.clone(),
                 node_limit,
                 time_limit,
+                // ilp
+                order_var_int,
+                class_constraint,
+                no_order,
+                initial_with_greedy,
+                ilp_time_sec,
+                ilp_num_threads,
+                output_dir.clone(),
             ),
             sim_pool: pool_manager::PoolManager::new(
                 "simulation",
@@ -165,24 +172,32 @@ where
                 egraph.clone(),
                 id.clone(),
                 rules.clone(),
-                cf.clone(),
-                lp_extract,
+                multi_patterns.clone(),
+                all_weight_only,
+                extraction.clone(),
                 prune_actions,
                 rollout_strategy.clone(),
                 node_limit,
                 time_limit,
+                // ilp
+                order_var_int,
+                class_constraint,
+                no_order,
+                initial_with_greedy,
+                ilp_time_sec,
+                ilp_num_threads,
+                output_dir.clone(),
             ),
             ckpts: HashMap::new(),
             ckpts_old: HashMap::new(),
-            cf: cf,
-            lp_extract: lp_extract,
+            all_weight_only: all_weight_only,
+            extraction: extraction.clone(),
+            final_extraction: final_extraction,
 
             prune_actions: prune_actions,
             // rollout_strategy: rollout_strategy,
             subtree_caching: subtree_caching,
             select_max_uct_action: select_max_uct_action,
-
-            output_dir: output_dir,
 
             root_node: Node::dummy(),
             best_child_node: None,
@@ -198,28 +213,49 @@ where
             d2: PhantomData,
             node_limit: node_limit,
             time_limit: time_limit,
+
+            output_dir: output_dir,
+            save_graph: save_graph,
+            export_models: export_models,
+
+            order_var_int: order_var_int,
+            class_constraint: class_constraint,
+            no_order: no_order,
+            initial_with_greedy: initial_with_greedy,
+            ilp_time_sec: ilp_time_sec,
+            ilp_num_threads: ilp_num_threads,
         }
     }
 
     pub fn run_loop(
         &mut self,
-        egraph: EGraph<L, N>,
+        egraph: EGraph<Mdl, TensorAnalysis>,
         id: Id,
-        rules: Vec<Rewrite<L, N>>,
-        cost_threshold: usize,
+        rules: Vec<Rewrite<Mdl, TensorAnalysis>>,
+        multi_patterns: Option<MultiPatterns>,
+        cost_threshold: f32,
         iter_limit: usize,
-    ) -> EGraph<L, N> {
+    ) -> EGraph<Mdl, TensorAnalysis> {
         // env
         // let mut env = Env::new(expr, rules, self.node_limit, self.time_limit);
         let mut env = EgraphEnv::new(
-            egraph,
+            egraph.clone(),
             id,
             rules,
-            self.cf.clone(),
-            self.lp_extract,
+            multi_patterns,
+            self.all_weight_only,
+            self.extraction.clone(),
             self.prune_actions,
             self.node_limit,
             self.time_limit,
+            // ilp
+            self.order_var_int,
+            self.class_constraint,
+            self.no_order,
+            self.initial_with_greedy,
+            self.ilp_time_sec,
+            self.ilp_num_threads,
+            self.output_dir.clone(),
         );
         env.reset();
 
@@ -254,8 +290,8 @@ where
             episode_reward += reward;
 
             println!(
-                "Iter {}; planning time {}s; reward {}; episode_reward {}; best cost {}",
-                iter, planning_time, reward, episode_reward, info.best_cost
+                "Iter {}; action {}; planning time {}s; reward {}; episode_reward {}; best cost {}",
+                iter, action, planning_time, reward, episode_reward, info.best_cost
             );
             println!("{}", info.report);
             println!("************************");
@@ -293,20 +329,82 @@ where
             }
         }
 
-        // Extract best cost and expression
-        let extractor = Extractor::new(&env.egraph, self.cf.clone());
-        let (rmcts_cost, rmcts_expr) = extractor.find_best(env.root_id);
-        save_data_to_file(&rmcts_expr, &self.output_dir, "rmcts_expr.txt");
+        // Extract final cost and expression
+        let cost_model: CostModel = tensat::optimize::CostModel::with_setting(self.all_weight_only);
+
+        let (final_cost, final_expr) = match self.final_extraction.as_str() {
+            "egg_greedy" => {
+                let tnsr_cost: TensorCost = tensat::optimize::TensorCost::new(&env.egraph, &cost_model, true);
+                let (cost, expr) = Extractor::new(&env.egraph, tnsr_cost).find_best(env.root_id);
+                (cost, expr)
+            }
+            "new_greedy" => {
+                let tnsr_cost: TensorCost = tensat::optimize::TensorCost::new(&env.egraph, &cost_model, false);
+                let (cost, expr) = Extractor::new(&env.egraph, tnsr_cost).find_best(env.root_id);
+                (cost, expr)
+            }
+            "egg_ilp" => {
+                let tnsr_cost: TensorCost = tensat::optimize::TensorCost::new(&env.egraph, &cost_model, true);
+                let (cost, expr) = LpExtractor::new(&env.egraph, tnsr_cost).solve(env.root_id);
+                (cost as f32, expr)
+            }
+            "tensat_ilp" => {
+                let ilp_dir = Path::new(&self.output_dir).join("ilp").into_os_string().into_string().unwrap();
+                let (expr, cost, duration) = extract_by_ilp_rmcts(&env.egraph, env.root_id, &cost_model, self.order_var_int, self.class_constraint, self.no_order, self.initial_with_greedy, self.ilp_time_sec, self.ilp_num_threads, ilp_dir, true);
+                (cost, expr)
+            }
+            _ => {
+                panic!("Extraction method not found!");
+            }
+        };
 
         println!(
-            "[RMCTS] Done:: base_cost {} -> cost {:?} with iter {} and time {}s",
-            env.base_cost, info.best_cost, iter, total_planning_time,
+            "[RMCTS] Done:: base_cost {} -> cost {} with iter {} and time {}s",
+            env.base_cost, final_cost, iter, total_planning_time,
         );
 
-        // Save RMCTS stats
+
+        // Save egraphs: non, io, all
+        let runner_start = Runner::<Mdl, TensorAnalysis, ()>::default().with_expr(&env.init_expr);
+        let runner_ext = Runner::<Mdl, TensorAnalysis, ()>::default().with_expr(&final_expr);
+
+        if self.save_graph != "none" {
+            let start_filename = Path::new(&self.output_dir).join("start.svg");
+            runner_start.egraph.dot().to_svg(start_filename).unwrap();
+
+            let ext_filename = Path::new(&self.output_dir).join("ext.svg");
+            runner_ext.egraph.dot().to_svg(ext_filename).unwrap();
+        }
+
+        if self.save_graph == "all" {
+            let filename = Path::new(&self.output_dir).join("rmcts.svg");
+            env.egraph.dot().to_svg(filename).unwrap();
+        }
+
+
+        // Save models
+        if self.export_models {
+            let filename_start = Path::new(&self.output_dir).join("start.model");
+            save_model(&runner_start, filename_start.to_str().unwrap());
+
+            let filename_optimized = Path::new(&self.output_dir).join("optimized.model");
+            save_model(&runner_ext, filename_optimized.to_str().unwrap());
+        }
+
+
+        // Obtain final graph runtime (same preprocess_weights settings as TENSAT)
+        let time_start = get_full_graph_runtime(&runner_start, false);
+        println!("Start graph runtime: {}", time_start);
+
+        let time_ext = get_full_graph_runtime(&runner_ext, true);
+        println!("Extracted graph runtime: {}", time_ext);
+
+        // Save RMCTS stats to file
         let rmcts_stats = json!({
             "base_cost": env.base_cost,
-            "best_cost": info.best_cost,
+            "final_cost": final_cost,
+            "original_runtime": time_start,
+            "optimized_runtime": time_ext,
             "optimization_time": total_planning_time,
         });
         save_data_to_file(&rmcts_stats, &self.output_dir, "rmcts_stats.txt");
@@ -317,7 +415,7 @@ where
 
     // fn plan(&mut self, _state: &(), env: &Env<L, N>) -> usize {
     // Returns: (action, #pruned root actions, #cached nodes)
-    fn plan(&mut self, _state: &(), env: &mut EgraphEnv<L, N, CF>) -> (usize, usize, u32) {
+    fn plan(&mut self, _state: &(), env: &mut EgraphEnv) -> (usize, usize, u32) {
         // skip if action space is 1
         let action_n = env.get_action_space();
         if action_n == 1 {
@@ -394,6 +492,10 @@ where
                 break
             }
 
+            if (sim_idx % 32) == 0 {
+                println!("Sim idx: {}", sim_idx);
+            }
+
             // print_tree(&self.root_node.borrow(), 3, 0);
 
             let (d, saturated) = self.simulate_single_step(sim_idx);
@@ -419,13 +521,18 @@ where
         // it is a bad idea to termiante a thread, perhaps just timeout a function in worker
         // thread, as a way to handle stragger
 
-        // final action
-        let best_action;
-        if self.select_max_uct_action {
-            best_action = self.root_node.borrow().select_uct_action(true)
-        } else {
-            best_action = self.root_node.borrow().select_max_visited_action()
+        // Check if root node has any non-saturated children
+        if self.root_node.borrow().visit_count as usize == self.root_node.borrow().children_saturated_cnt {
+            println!("All children of root node are saturated!");
+            // return (usize::MAX, self.root_node.borrow().children_pruned, root_visit_count)
         }
+
+        // pick final action
+        let best_action = if self.select_max_uct_action {
+            self.root_node.borrow().select_uct_action(true)
+        } else {
+            self.root_node.borrow().select_max_visited_action()
+        };
 
         // Subtree caching
         if self.subtree_caching {
