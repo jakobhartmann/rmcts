@@ -13,11 +13,11 @@ models=(
 )
 
 experiments=(
-    # "egg_greedy, egg_greedy"
-    # "egg_greedy, tensat_ilp"
-    # "new_greedy, new_greedy"
+    "egg_greedy, egg_greedy"
+    "egg_greedy, tensat_ilp"
+    "new_greedy, new_greedy"
     "new_greedy, tensat_ilp"
-    # "tensat_ilp, tensat_ilp"
+    "tensat_ilp, tensat_ilp"
 )
 
 # export TASO_GPU_WARMUP=0
@@ -28,11 +28,6 @@ for seed in $(seq 0 $(expr $num_passes - 1)); do
         for experiment in "${experiments[@]}"; do 
             IFS=", ";
             set $experiment;
-            # Error handling: Clean up any potential core dumps and then proceed
-            if test -f /usr/rmcts/core.*; then
-                rm /usr/rmcts/core.*
-                echo "Deleting dumped core file."
-            fi
             echo "Running experiment:" $seed $model $1 $2;
             RUST_BACKTRACE=1 cargo run --release -- --seed $seed --model $model --extraction $1 --final_extraction $2
         done

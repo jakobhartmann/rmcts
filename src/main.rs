@@ -122,7 +122,7 @@ struct Settings {
 
 fn main() {
     // Read cmd arguments
-    let args = App::new("tensor-rmcts")
+    let args = App::new("tensor-eqs-mcts")
         .arg(
             Arg::with_name("model")
                 .long("model")
@@ -153,15 +153,11 @@ fn main() {
         )
         .get_matches();
 
-    // Set memory limit to prevent system-wide OOM
-    ALLOCATOR.set_limit(50 * 1024 * 1024 * 1024).unwrap();
-    println!("Memory limit: {}B", ALLOCATOR.limit());
-
     let mut settings = Settings {
         model: String::from("resnet50"),
         rules: String::from("/usr/tensat/converted.txt"),
         multi_rules: String::from("/usr/tensat/converted_multi.txt"),
-        save_graph: String::from("all"),
+        save_graph: String::from("io"),
 
         n_sec: 10,
         n_nodes: 2_000,
@@ -192,13 +188,13 @@ fn main() {
         cost_threshold: 0.1,
         iter_limit: 200,
         prune_actions: true,
-        rollout_strategy: String::from("heavy"),
+        rollout_strategy: String::from("random"),
         subtree_caching: false,
         select_max_uct_action: true,
 
         // experiment tracking
         seed: 0,
-        experiments_base_path: String::from("/usr/experiments/rmcts/"),
+        experiments_base_path: String::from("/usr/experiments/tensor_eqs_mcts/"),
     };
 
     // // Experiment: extraction methods (egg_greedy, new_greedy, tensat_ilp)
@@ -230,7 +226,7 @@ fn main() {
         .unwrap();
     settings.final_extraction = final_extraction.clone();
 
-    settings.experiments_base_path = String::from("/usr/experiments/rmcts/tests/simple_example");
+    settings.experiments_base_path = String::from("/usr/experiments/tensor_eqs_mcts/");
 
     if model == String::from("nasrnn") {
         settings.multi_rules = String::from("/usr/tensat/converted_multi_nasrnn.txt");
