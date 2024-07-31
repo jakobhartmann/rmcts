@@ -226,7 +226,7 @@ fn main() {
         .unwrap();
     settings.final_extraction = final_extraction.clone();
 
-    settings.experiments_base_path = String::from("/usr/experiments/tensor_eqs_mcts/");
+    settings.experiments_base_path = String::from("/usr/experiments/tensor_eqs_mcts/") + &extraction + "_" + &final_extraction + "/";
 
     if model == String::from("nasrnn") {
         settings.multi_rules = String::from("/usr/tensat/converted_multi_nasrnn.txt");
